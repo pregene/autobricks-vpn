@@ -150,9 +150,6 @@ fn connect(
     let mut dtls = Dtls::new(config)?;
     dtls.set_socket(socket_fd(&socket))?;
     dtls.set_nonblocking(true);
-    if verify_server_san_ip {
-        dtls.verify_peer_ip(server)?;
-    }
     let server_peer = socket_addr_storage(SocketAddr::from((server, port)));
     dtls.set_peer(&server_peer, ipv4_socket_addr_size())?;
     let io = DtlsIo::new_client(
@@ -183,6 +180,12 @@ fn connect(
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
             "client shutdown requested",
+        ));
+    }
+    if verify_server_san_ip && !dtls.peer_certificate_has_san_ip(server)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("server certificate SAN IP does not match {server}"),
         ));
     }
     eprintln!("[client] DTLS handshake complete");

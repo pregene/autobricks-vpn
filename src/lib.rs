@@ -224,11 +224,17 @@ impl IpRateLimiter {
 }
 
 #[cfg(unix)]
+// Byte strings keep this function buildable with Ubuntu 22.04's Rust 1.75.
+#[allow(clippy::manual_c_str_literals)]
 pub fn syslog_connection_event(message: &str) {
     if let Ok(message) = CString::new(message) {
         unsafe {
-            libc::openlog(c"autobricks-vpn".as_ptr(), libc::LOG_PID, libc::LOG_LOCAL0);
-            libc::syslog(libc::LOG_INFO, c"%s".as_ptr(), message.as_ptr());
+            libc::openlog(
+                b"autobricks-vpn\0".as_ptr().cast(),
+                libc::LOG_PID,
+                libc::LOG_LOCAL0,
+            );
+            libc::syslog(libc::LOG_INFO, b"%s\0".as_ptr().cast(), message.as_ptr());
         }
     }
 }
@@ -356,7 +362,9 @@ extern "C" {
     fn wolfDTLSv1_3_server_method() -> *mut WolfMethod;
     #[cfg(feature = "dtls13")]
     fn wolfDTLSv1_3_client_method() -> *mut WolfMethod;
+    #[cfg(not(feature = "dtls13"))]
     fn wolfDTLSv1_2_server_method() -> *mut WolfMethod;
+    #[cfg(not(feature = "dtls13"))]
     fn wolfDTLSv1_2_client_method() -> *mut WolfMethod;
     fn wolfSSL_set_fd(ssl: *mut WolfSsl, fd: c_int) -> c_int;
     fn wolfSSL_dtls_set_using_nonblock(ssl: *mut WolfSsl, nonblock: c_int);
@@ -381,7 +389,6 @@ extern "C" {
         secret: *const c_uchar,
         secret_size: c_uint,
     ) -> c_int;
-    fn wolfSSL_check_ip_address(ssl: *mut WolfSsl, ipaddr: *const c_char) -> c_int;
     fn wolfSSL_accept(ssl: *mut WolfSsl) -> c_int;
     fn wolfSSL_connect(ssl: *mut WolfSsl) -> c_int;
     fn wolfSSL_read(ssl: *mut WolfSsl, buffer: *mut c_void, size: c_int) -> c_int;
@@ -566,21 +573,6 @@ impl Dtls {
                 self.ssl,
                 peer as *const _ as *mut c_void,
                 peer_size as c_uint,
-            ))
-        }
-    }
-
-    pub fn verify_peer_ip(&mut self, expected: Ipv4Addr) -> io::Result<()> {
-        if self.ssl.is_null() {
-            return Err(io::Error::other("DTLS socket is not initialized"));
-        }
-        let expected = CString::new(expected.to_string()).map_err(invalid_input)?;
-        let result = unsafe { wolfSSL_check_ip_address(self.ssl, expected.as_ptr()) };
-        if result == SUCCESS {
-            Ok(())
-        } else {
-            Err(io::Error::other(
-                "unable to enable peer certificate SAN IP verification",
             ))
         }
     }
@@ -1092,6 +1084,7 @@ impl Drop for ForwardingGuard {
 }
 
 pub struct DnsGuard {
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     interface: String,
     #[cfg(target_os = "macos")]
     services: Vec<(String, Vec<String>)>,
@@ -1116,6 +1109,7 @@ impl DnsGuard {
         }
         #[cfg(target_os = "macos")]
         {
+            let _ = interface;
             let output = Command::new("networksetup")
                 .arg("-listallnetworkservices")
                 .output()?;
@@ -1129,7 +1123,6 @@ impl DnsGuard {
                 .map(str::to_owned)
                 .collect::<Vec<_>>();
             let mut guard = Self {
-                interface: interface.to_owned(),
                 services: Vec::new(),
             };
             for service in services {

@@ -424,9 +424,11 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
                 } else {
                     HANDSHAKE_TIMEOUT
                 };
-            let lifetime_valid = session
-                .established_at
-                .is_none_or(|established_at| established_at.elapsed() < max_session_lifetime);
+            // Keep compatibility with the Ubuntu 22.04 Rust 1.75 toolchain.
+            #[allow(clippy::unnecessary_map_or)]
+            let lifetime_valid = session.established_at.map_or(true, |established_at| {
+                established_at.elapsed() < max_session_lifetime
+            });
             if idle_valid && !lifetime_valid {
                 session.disconnect_reason = "max_session_lifetime";
                 eprintln!(
