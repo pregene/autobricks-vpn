@@ -1,5 +1,4 @@
 fn main() {
-    println!("cargo:rustc-link-lib=wolfssl");
     if let Ok(prefix) = std::env::var("WOLFSSL_PREFIX") {
         println!("cargo:rustc-link-search=native={prefix}/lib");
         println!("cargo:include={prefix}/include");
