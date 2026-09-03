@@ -166,6 +166,8 @@ chmod 600 certs/*-key.pem
 
 위 표의 성공은 빌드 또는 단위 테스트만의 결과가 아니라 실제 서버와 클라이언트를 실행해 터널 트래픽을 확인한 결과입니다. Windows 코드는 빌드 경로를 제공하지만 아직 실제 Windows 장비에서 검증하지 않았습니다.
 
+현재 개발용 debug 빌드의 실환경 비교에서는 WireGuard보다 처리 속도가 최대 약 3배 낮게 관찰되었습니다. 이는 확정된 제품 성능 수치가 아니며, 사용자 공간의 TUN/DTLS 처리, packet 복사, 단일 event loop와 최적화되지 않은 debug 빌드가 함께 영향을 줄 수 있습니다. 백업 VPN 기능 검증 단계에서는 현재 구현을 유지하고, 릴리스 준비 시 release 빌드 전환, `iperf3` 정방향·역방향 측정, CPU 사용률과 packet loss 확인, MTU 및 packet 처리 경로 최적화를 진행한 뒤 다시 비교할 예정입니다.
+
 ## Build
 
 VPN 구현이 들어 있는 동적 라이브러리와 이를 호출하는 `vpn-server`, `vpn-client` launcher를 Cargo로 빌드합니다.
