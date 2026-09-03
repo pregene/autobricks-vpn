@@ -1,0 +1,25 @@
+[package]
+name = "autobricks-vpn"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+wintun = "0.5.1"
+
+[features]
+default = []
+dtls13 = []
+
+[[bin]]
+name = "vpn-server"
+path = "src/bin/vpn-server.rs"
+
+[[bin]]
+name = "vpn-client"
+path = "src/bin/vpn-client.rs"
