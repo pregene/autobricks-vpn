@@ -75,10 +75,13 @@ cd wolfssl
 ./configure --prefix=/opt/wolfssl-autobricks \
   --enable-dtls --enable-dtls13 --enable-dtls-mtu \
   --enable-crl --enable-ocsp --enable-opensslextra \
-  --enable-ip-alt-name
+  --enable-ip-alt-name \
+  --enable-aesni --enable-intelasm --enable-sp --enable-sp-asm
 make -j4
 sudo make install
 ```
+
+`--enable-aesni`, `--enable-intelasm`, `--enable-sp --enable-sp-asm`는 x86_64에서 AES-NI 및 SIMD 기반 암호 연산을 켭니다. 이 플래그 없이 빌드하면 wolfSSL은 순수 소프트웨어 AES로 동작해 패킷당 암복호화 비용이 눈에 띄게 커집니다. ARM64(예: Apple Silicon, AWS Graviton)에서는 대신 `--enable-armasm`을 사용합니다. 빌드 후 `grep -E "AESNI|USE_INTEL_SPEEDUP" /opt/wolfssl-autobricks/include/wolfssl/options.h`로 실제로 활성화됐는지 확인할 수 있습니다.
 
 프로젝트 빌드 시 설치 위치와 Rust의 DTLS 1.3 코드를 함께 지정합니다.
 

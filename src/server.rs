@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 compile_error!("vpn-server supports Linux and macOS only");
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
+/// Caps how many packets are drained per wakeup so one busy fd cannot starve the other.
+const DRAIN_BATCH_LIMIT: u32 = 64;
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PENDING_PER_IP: usize = 2;
@@ -278,6 +280,7 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
     eprintln!("[server] UDP bound to {listen}:{port}");
     socket.set_nonblocking(true)?;
     let fd = socket_fd(&socket);
+    autobricks_vpn::enlarge_udp_buffers(fd);
     let vpn_address_text = value(&server, "vpn_address", "10.8.1.1");
     let vpn_address: Ipv4Addr = vpn_address_text
         .parse()
@@ -442,38 +445,46 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
             idle_valid && lifetime_valid
         });
         if fds[1].revents & libc::POLLIN != 0 {
-            let count = match tun.read_packet(&mut packet) {
-                Ok(count) => count,
-                Err(error) => match autobricks_vpn::classify_tun_error(&error) {
-                    TunErrorAction::Retry | TunErrorAction::DropPacket => 0,
-                    TunErrorAction::Fatal => return Err(error),
-                },
-            };
-            if let Some(destination) = ipv4_destination(&packet[..count]) {
-                let broadcast = ipv4_is_broadcast(destination, network_address, network_prefix);
-                let multicast = destination.is_multicast();
-                if (broadcast && allow_broadcast) || (multicast && allow_multicast) {
-                    let mut index = 0;
-                    while index < sessions.len() {
-                        if sessions[index].established
-                            && !send_tunnel_packet(&mut sessions[index], &packet[..count])
-                        {
-                            sessions.swap_remove(index);
-                        } else {
-                            index += 1;
+            // Drain queued TUN packets so a burst on one client doesn't push others onto a
+            // separate poll() wakeup, which otherwise adds latency for interactive traffic.
+            for _ in 0..DRAIN_BATCH_LIMIT {
+                let count = match tun.read_packet(&mut packet) {
+                    Ok(count) => count,
+                    Err(error) => match autobricks_vpn::classify_tun_error(&error) {
+                        TunErrorAction::Retry | TunErrorAction::DropPacket => break,
+                        TunErrorAction::Fatal => return Err(error),
+                    },
+                };
+                if count == 0 {
+                    break;
+                }
+                if let Some(destination) = ipv4_destination(&packet[..count]) {
+                    let broadcast =
+                        ipv4_is_broadcast(destination, network_address, network_prefix);
+                    let multicast = destination.is_multicast();
+                    if (broadcast && allow_broadcast) || (multicast && allow_multicast) {
+                        let mut index = 0;
+                        while index < sessions.len() {
+                            if sessions[index].established
+                                && !send_tunnel_packet(&mut sessions[index], &packet[..count])
+                            {
+                                sessions.swap_remove(index);
+                            } else {
+                                index += 1;
+                            }
                         }
-                    }
-                } else if !broadcast && !multicast {
-                    if let Some((index, _)) = sessions
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, session)| {
-                            session.established && session.address == destination
-                        })
-                        .max_by_key(|(_, session)| session.last_activity)
-                    {
-                        if !send_tunnel_packet(&mut sessions[index], &packet[..count]) {
-                            sessions.swap_remove(index);
+                    } else if !broadcast && !multicast {
+                        if let Some((index, _)) = sessions
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, session)| {
+                                session.established && session.address == destination
+                            })
+                            .max_by_key(|(_, session)| session.last_activity)
+                        {
+                            if !send_tunnel_packet(&mut sessions[index], &packet[..count]) {
+                                sessions.swap_remove(index);
+                            }
                         }
                     }
                 }

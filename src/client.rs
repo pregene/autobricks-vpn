@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
+/// Caps how many packets are drained per wakeup so one busy fd cannot starve the other.
+const DRAIN_BATCH_LIMIT: u32 = 64;
 
 #[cfg(unix)]
 extern "C" fn stop(_signal: libc::c_int) {
@@ -145,6 +147,8 @@ fn connect(
     let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
     socket.connect(SocketAddr::from((server, port)))?;
     socket.set_nonblocking(true)?;
+    #[cfg(unix)]
+    autobricks_vpn::enlarge_udp_buffers(socket_fd(&socket));
     eprintln!("[client] UDP connected to {server}:{port}");
 
     let mut dtls = Dtls::new(config)?;
@@ -273,12 +277,17 @@ fn run_connection(
             }
         }
         if tun_ready {
-            let count = match tun.read_packet(&mut packet) {
-                Ok(count) => count,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => 0,
-                Err(error) => return Err(error),
-            };
-            if count > 0 {
+            // Drain everything queued on the TUN device so a burst of local traffic doesn't
+            // each need a separate poll() wakeup, which otherwise delays interactive packets.
+            for _ in 0..DRAIN_BATCH_LIMIT {
+                let count = match tun.read_packet(&mut packet) {
+                    Ok(count) => count,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(error),
+                };
+                if count == 0 {
+                    break;
+                }
                 match dtls.write(&packet[..count]) {
                     Ok(written) if written == count => {}
                     Ok(written) => eprintln!(
@@ -292,19 +301,21 @@ fn run_connection(
             }
         }
         if socket_ready {
-            let count = match dtls.read(&mut packet) {
-                Ok(count) => count,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(error) => return Err(error),
-            };
-            last_server_activity = Instant::now();
-            if is_keepalive_packet(&packet[..count]) {
-                continue;
-            }
-            if ipv4_packet_addresses(&packet[..count]).is_some() {
-                tun.write_packet(&packet[..count])?;
-            } else {
-                eprintln!("[client] malformed IPv4 packet from server dropped");
+            for _ in 0..DRAIN_BATCH_LIMIT {
+                let count = match dtls.read(&mut packet) {
+                    Ok(count) => count,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(error),
+                };
+                last_server_activity = Instant::now();
+                if is_keepalive_packet(&packet[..count]) {
+                    continue;
+                }
+                if ipv4_packet_addresses(&packet[..count]).is_some() {
+                    tun.write_packet(&packet[..count])?;
+                } else {
+                    eprintln!("[client] malformed IPv4 packet from server dropped");
+                }
             }
         }
     }

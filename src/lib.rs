@@ -284,6 +284,30 @@ pub fn validate_private_key_file(path: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Best-effort UDP buffer enlargement to avoid kernel-level (ENOBUFS) drops under bursty
+/// tunnel traffic; the kernel silently clamps this to net.core.[rw]mem_max, so failures here
+/// are non-fatal and intentionally ignored.
+#[cfg(unix)]
+pub fn enlarge_udp_buffers(fd: RawFd) {
+    const BUFFER_BYTES: c_int = 4 * 1024 * 1024;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &BUFFER_BYTES as *const c_int as *const c_void,
+            mem::size_of::<c_int>() as libc::socklen_t,
+        );
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &BUFFER_BYTES as *const c_int as *const c_void,
+            mem::size_of::<c_int>() as libc::socklen_t,
+        );
+    }
+}
+
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TunErrorAction {
