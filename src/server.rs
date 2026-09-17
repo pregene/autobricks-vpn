@@ -10,9 +10,7 @@ use std::io;
 use std::io::Read;
 use std::mem;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::os::fd::{AsRawFd, RawFd};
-#[cfg(windows)]
-use std::os::windows::io::AsRawSocket;
+use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -190,21 +188,6 @@ fn peer_ipv4(peer: &libc::sockaddr_storage) -> Option<Ipv4Addr> {
     Some(Ipv4Addr::from(peer.sin_addr.s_addr.to_ne_bytes()))
 }
 
-fn poll(fds: &mut [libc::pollfd], timeout: Duration) -> io::Result<()> {
-    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-    let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
-    if result < 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
-            Ok(())
-        } else {
-            Err(error)
-        }
-    } else {
-        Ok(())
-    }
-}
-
 fn send_tunnel_packet(session: &mut Session, packet: &[u8]) -> bool {
     match panic_gate("server DTLS write", || session.dtls.write(packet)) {
         Ok(written) if written == packet.len() => {
@@ -279,7 +262,7 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
     let socket = std::net::UdpSocket::bind(SocketAddr::from((listen, port)))?;
     eprintln!("[server] UDP bound to {listen}:{port}");
     socket.set_nonblocking(true)?;
-    let fd = socket_fd(&socket);
+    let fd = crate::platform::socket_handle(&socket);
     autobricks_vpn::enlarge_udp_buffers(fd);
     let vpn_address_text = value(&server, "vpn_address", "10.8.1.1");
     let vpn_address: Ipv4Addr = vpn_address_text
@@ -375,31 +358,7 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
             .min()
             .unwrap_or(Duration::from_secs(1))
             .min(Duration::from_secs(1));
-        let mut fds = [
-            libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: tun.fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        poll(&mut fds, poll_timeout)?;
-        if fds[1].revents & libc::POLLNVAL != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "TUN descriptor is invalid",
-            ));
-        }
-        if fds[1].revents & (libc::POLLERR | libc::POLLHUP) != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "TUN device reported a permanent poll error",
-            ));
-        }
+        let ready = crate::platform::wait_io(&socket, &tun, poll_timeout)?;
         let now = Instant::now();
         let mut session_index = 0;
         while session_index < sessions.len() {
@@ -444,7 +403,7 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
             }
             idle_valid && lifetime_valid
         });
-        if fds[1].revents & libc::POLLIN != 0 {
+        if ready.tun {
             // Drain queued TUN packets so a burst on one client doesn't push others onto a
             // separate poll() wakeup, which otherwise adds latency for interactive traffic.
             for _ in 0..DRAIN_BATCH_LIMIT {
@@ -459,8 +418,7 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
                     break;
                 }
                 if let Some(destination) = ipv4_destination(&packet[..count]) {
-                    let broadcast =
-                        ipv4_is_broadcast(destination, network_address, network_prefix);
+                    let broadcast = ipv4_is_broadcast(destination, network_address, network_prefix);
                     let multicast = destination.is_multicast();
                     if (broadcast && allow_broadcast) || (multicast && allow_multicast) {
                         let mut index = 0;
@@ -490,7 +448,7 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
                 }
             }
         }
-        if fds[0].revents & libc::POLLIN != 0 {
+        if ready.udp {
             let (peer, peer_size, incoming) = match receive_peer(fd) {
                 Ok(packet) => packet,
                 Err(error)
@@ -760,14 +718,4 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
     }
     eprintln!("[server] shutting down; client forwarding rule removed");
     Ok(())
-}
-
-#[cfg(unix)]
-fn socket_fd(socket: &std::net::UdpSocket) -> RawFd {
-    socket.as_raw_fd()
-}
-
-#[cfg(windows)]
-fn socket_fd(socket: &std::net::UdpSocket) -> RawFd {
-    socket.as_raw_socket() as RawFd
 }

@@ -175,6 +175,16 @@ chmod 600 certs/*-key.pem
 
 VPN 구현이 들어 있는 동적 라이브러리와 이를 호출하는 `vpn-server`, `vpn-client` launcher를 Cargo로 빌드합니다.
 
+OS 종속 packet I/O와 TUN 구현은 공통 DTLS/session 코드와 분리되어 있습니다.
+
+| 경로 | 현재 구현 | 확장 경계 |
+| --- | --- | --- |
+| `src/linux/` | `/dev/net/tun`, nonblocking UDP, `poll` readiness | `io_uring` completion 및 batch I/O |
+| `src/macos/` | `utun`, 4-byte protocol header, `poll` readiness | `kqueue` readiness |
+| `src/windows/` | Wintun ring, nonblocking UDP 확인 | Overlapped I/O/IOCP와 Wintun read event |
+
+공통 client/server 루프는 OS API를 직접 호출하지 않고 선택된 platform backend의 `wait_udp`, `wait_io` 및 `Tun`을 사용합니다. 따라서 이후 Linux `io_uring` 또는 Windows IOCP를 도입할 때 DTLS 인증과 session routing 코드를 별도로 복제하지 않습니다.
+
 ```sh
 brew install wolfssl
 cargo build

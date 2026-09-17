@@ -17,8 +17,19 @@ use std::time::Duration;
 use std::time::Instant;
 
 mod client;
+#[cfg(target_os = "linux")]
+#[path = "linux/mod.rs"]
+mod platform;
+#[cfg(target_os = "macos")]
+#[path = "macos/mod.rs"]
+mod platform;
+#[cfg(windows)]
+#[path = "windows/mod.rs"]
+mod platform;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod server;
+
+pub use platform::Tun;
 
 fn run_from_ffi(config_path: *const c_char, runner: impl FnOnce(&str) -> io::Result<()>) -> c_int {
     if config_path.is_null() {
@@ -380,8 +391,6 @@ extern "C" {
         kind: c_int,
         monitor: c_int,
     ) -> c_int;
-    #[cfg(target_os = "macos")]
-    fn wolfSSL_CTX_dtls_set_mtu(ctx: *mut WolfCtx, mtu: u16) -> c_int;
     #[cfg(feature = "dtls13")]
     fn wolfDTLSv1_3_server_method() -> *mut WolfMethod;
     #[cfg(feature = "dtls13")]
@@ -551,10 +560,10 @@ impl Dtls {
                     ));
                 }
             }
-            #[cfg(target_os = "macos")]
-            if config.mtu > 0 {
-                wolfSSL_CTX_dtls_set_mtu(ctx, config.mtu);
-            }
+            // `config.mtu` is the inner TUN MTU, not the outer DTLS datagram MTU.
+            // Applying the same value to wolfSSL leaves no room for the DTLS record
+            // header and authentication tag and makes full-sized tunnel packets fail
+            // with DTLS_SIZE_ERROR. Keep wolfSSL's transport-MTU default instead.
             Ok(Self {
                 ctx,
                 ssl: ptr::null_mut(),
@@ -981,14 +990,6 @@ unsafe extern "C" fn dtls_send(
     }
 }
 
-pub struct Tun {
-    fd: RawFd,
-    macos_header: bool,
-    name: String,
-    #[cfg(windows)]
-    session: std::sync::Arc<wintun::Session>,
-}
-
 pub struct ForwardingGuard {
     #[cfg(target_os = "linux")]
     interface: String,
@@ -1236,400 +1237,24 @@ impl Drop for DnsGuard {
     }
 }
 
-impl Tun {
-    pub fn open(requested_name: &str) -> io::Result<Self> {
-        #[cfg(target_os = "macos")]
-        {
-            Self::open_utun(requested_name)
-        }
-        #[cfg(target_os = "linux")]
-        {
-            Self::open_linux(requested_name)
-        }
-        #[cfg(windows)]
-        {
-            Self::open_windows(requested_name)
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-        {
-            let _ = requested_name;
-            Err(io::Error::other("TUN is unsupported on this platform"))
-        }
+fn validate_tun_ipv4<'a>(address: &str, peer: &str, network: &'a str) -> io::Result<(&'a str, u8)> {
+    let (network_address, prefix) = network
+        .split_once('/')
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "network must be CIDR"))?;
+    let prefix: u8 = prefix
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid network prefix"))?;
+    if prefix > 32
+        || address.parse::<Ipv4Addr>().is_err()
+        || peer.parse::<Ipv4Addr>().is_err()
+        || network_address.parse::<Ipv4Addr>().is_err()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid IPv4 TUN configuration",
+        ));
     }
-
-    #[cfg(target_os = "macos")]
-    #[allow(clippy::manual_c_str_literals)]
-    fn open_utun(_requested_name: &str) -> io::Result<Self> {
-        const CTL_NAME: &[u8] = b"com.apple.net.utun_control\0";
-        #[repr(C)]
-        struct CtlInfo {
-            ctl_id: u32,
-            ctl_name: [u8; 96],
-        }
-        #[repr(C)]
-        struct SockAddrCtl {
-            sc_len: u8,
-            sc_family: u8,
-            ss_sysaddr: u16,
-            sc_id: u32,
-            sc_unit: u32,
-            sc_reserved: [u32; 5],
-        }
-        let mut info = CtlInfo {
-            ctl_name: [0; 96],
-            ctl_id: 0,
-        };
-        info.ctl_name[..CTL_NAME.len()].copy_from_slice(CTL_NAME);
-        unsafe {
-            let fd = libc::socket(32, libc::SOCK_DGRAM, 2);
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::ioctl(fd, 0xc0644e03u64, &mut info) < 0 {
-                let error = io::Error::last_os_error();
-                libc::close(fd);
-                return Err(error);
-            }
-            let address = SockAddrCtl {
-                sc_len: mem::size_of::<SockAddrCtl>() as u8,
-                sc_family: 32,
-                ss_sysaddr: 2,
-                sc_id: info.ctl_id,
-                sc_unit: 0,
-                sc_reserved: [0; 5],
-            };
-            if libc::connect(
-                fd,
-                &address as *const _ as *const libc::sockaddr,
-                mem::size_of::<SockAddrCtl>() as u32,
-            ) < 0
-            {
-                let error = io::Error::last_os_error();
-                libc::close(fd);
-                return Err(error);
-            }
-            let mut name = [0u8; 16];
-            let mut name_len = name.len() as libc::socklen_t;
-            if libc::getsockopt(fd, 2, 2, name.as_mut_ptr() as *mut c_void, &mut name_len) < 0 {
-                let error = io::Error::last_os_error();
-                libc::close(fd);
-                return Err(error);
-            }
-            let name = CStr::from_bytes_until_nul(&name)
-                .unwrap_or(CStr::from_bytes_with_nul(b"utun\0").unwrap())
-                .to_string_lossy()
-                .into_owned();
-            Ok(Self {
-                fd,
-                macos_header: true,
-                name,
-            })
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn open_linux(requested_name: &str) -> io::Result<Self> {
-        #[repr(C)]
-        struct IfReq {
-            name: [u8; libc::IFNAMSIZ],
-            flags: libc::c_short,
-            padding: [u8; 22],
-        }
-        const TUNSETIFF: libc::c_ulong = 0x400454ca;
-        const IFF_TUN: libc::c_short = 0x0001;
-        const IFF_NO_PI: libc::c_short = 0x1000;
-        let fd = unsafe { libc::open(b"/dev/net/tun\0".as_ptr() as *const c_char, libc::O_RDWR) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut request = IfReq {
-            name: [0; libc::IFNAMSIZ],
-            flags: IFF_TUN | IFF_NO_PI,
-            padding: [0; 22],
-        };
-        for (slot, byte) in request.name.iter_mut().zip(requested_name.bytes()) {
-            *slot = byte;
-        }
-        if unsafe { libc::ioctl(fd, TUNSETIFF, &mut request) } < 0 {
-            let error = io::Error::last_os_error();
-            unsafe {
-                libc::close(fd);
-            }
-            return Err(error);
-        }
-        let name = String::from_utf8_lossy(&request.name)
-            .trim_end_matches('\0')
-            .to_string();
-        Ok(Self {
-            fd,
-            macos_header: false,
-            name,
-        })
-    }
-
-    #[cfg(windows)]
-    fn open_windows(requested_name: &str) -> io::Result<Self> {
-        let dll = std::env::var("WINTUN_DLL").unwrap_or_else(|_| "wintun.dll".to_string());
-        let wintun = unsafe { wintun::load_from_path(dll) }
-            .map_err(|error| io::Error::other(format!("loading Wintun: {error}")))?;
-        let adapter = wintun::Adapter::open(&wintun, requested_name)
-            .or_else(|_| wintun::Adapter::create(&wintun, requested_name, "autobricks-vpn", None))
-            .map_err(|error| io::Error::other(format!("opening Wintun adapter: {error}")))?;
-        let session = std::sync::Arc::new(
-            adapter
-                .start_session(wintun::MAX_RING_CAPACITY)
-                .map_err(|error| io::Error::other(format!("starting Wintun session: {error}")))?,
-        );
-        Ok(Self {
-            fd: 0,
-            macos_header: false,
-            name: requested_name.to_string(),
-            session,
-        })
-    }
-
-    pub fn fd(&self) -> RawFd {
-        self.fd
-    }
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-    pub fn configure_mtu(&self, mtu: u16) -> io::Result<()> {
-        validate_mtu(mtu)?;
-        #[cfg(target_os = "macos")]
-        {
-            run_command("ifconfig", &[&self.name, "mtu", &mtu.to_string()])
-        }
-        #[cfg(target_os = "linux")]
-        {
-            run_command(
-                "ip",
-                &["link", "set", "dev", &self.name, "mtu", &mtu.to_string()],
-            )
-        }
-        #[cfg(windows)]
-        {
-            run_command(
-                "netsh",
-                &[
-                    "interface",
-                    "ipv4",
-                    "set",
-                    "subinterface",
-                    &self.name,
-                    &format!("mtu={mtu}"),
-                    "store=active",
-                ],
-            )
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-        {
-            let _ = mtu;
-            Err(io::Error::other(
-                "TUN MTU configuration is unsupported on this platform",
-            ))
-        }
-    }
-    pub fn configure_ipv4(&self, address: &str, peer: &str, network: &str) -> io::Result<()> {
-        let (network_address, prefix) = network
-            .split_once('/')
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "network must be CIDR"))?;
-        let prefix: u8 = prefix
-            .parse()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid network prefix"))?;
-        if prefix > 32
-            || address.parse::<Ipv4Addr>().is_err()
-            || peer.parse::<Ipv4Addr>().is_err()
-            || network_address.parse::<Ipv4Addr>().is_err()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid IPv4 TUN configuration",
-            ));
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let mask = Ipv4Addr::from(if prefix == 0 {
-                0
-            } else {
-                u32::MAX << (32 - prefix)
-            });
-            run_command(
-                "ifconfig",
-                &[
-                    &self.name,
-                    address,
-                    peer,
-                    "netmask",
-                    &mask.to_string(),
-                    "up",
-                ],
-            )?;
-            run_command(
-                "route",
-                &[
-                    "-n",
-                    "add",
-                    "-net",
-                    network_address,
-                    "-netmask",
-                    &mask.to_string(),
-                    "-interface",
-                    &self.name,
-                ],
-            )
-        }
-        #[cfg(target_os = "linux")]
-        {
-            run_command(
-                "ip",
-                &[
-                    "addr",
-                    "replace",
-                    &format!("{address}/{prefix}"),
-                    "dev",
-                    &self.name,
-                ],
-            )?;
-            run_command("ip", &["link", "set", "dev", &self.name, "up"])?;
-            run_command("ip", &["route", "replace", network, "dev", &self.name])
-        }
-        #[cfg(windows)]
-        {
-            let mask = Ipv4Addr::from(if prefix == 0 {
-                0
-            } else {
-                u32::MAX << (32 - prefix)
-            });
-            run_command(
-                "netsh",
-                &[
-                    "interface",
-                    "ip",
-                    "set",
-                    "address",
-                    &format!("name={}", self.name),
-                    "static",
-                    address,
-                    &mask.to_string(),
-                    peer,
-                ],
-            )?;
-            run_command(
-                "route",
-                &["ADD", network_address, "MASK", &mask.to_string(), peer],
-            )
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-        {
-            let _ = (address, peer, network);
-            Err(io::Error::other(
-                "TUN configuration is unsupported on this platform",
-            ))
-        }
-    }
-    pub fn read_packet(&self, buffer: &mut [u8]) -> io::Result<usize> {
-        #[cfg(windows)]
-        {
-            return match self
-                .session
-                .try_receive()
-                .map_err(|error| io::Error::other(error.to_string()))?
-            {
-                Some(packet) if packet.bytes().len() <= buffer.len() => {
-                    buffer[..packet.bytes().len()].copy_from_slice(packet.bytes());
-                    Ok(packet.bytes().len())
-                }
-                Some(_) => Err(io::Error::other("TUN packet too large")),
-                None => Err(io::Error::from(io::ErrorKind::WouldBlock)),
-            };
-        }
-        #[cfg(unix)]
-        let mut packet = [0u8; 2048];
-        #[cfg(unix)]
-        let target_ptr = if self.macos_header {
-            packet.as_mut_ptr()
-        } else {
-            buffer.as_mut_ptr()
-        };
-        #[cfg(unix)]
-        let target_len = if self.macos_header {
-            packet.len()
-        } else {
-            buffer.len()
-        };
-        #[cfg(unix)]
-        let count = unsafe { libc::read(self.fd, target_ptr as *mut c_void, target_len) };
-        #[cfg(unix)]
-        if count < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        #[cfg(unix)]
-        let count = count as usize;
-        #[cfg(unix)]
-        if self.macos_header {
-            if count <= 4 || count - 4 > buffer.len() {
-                return Err(io::Error::other("TUN packet too large"));
-            }
-            buffer[..count - 4].copy_from_slice(&packet[4..count]);
-            Ok(count - 4)
-        } else {
-            Ok(count)
-        }
-    }
-    pub fn write_packet(&self, buffer: &[u8]) -> io::Result<usize> {
-        #[cfg(windows)]
-        {
-            let mut packet = self
-                .session
-                .allocate_send_packet(buffer.len() as u16)
-                .map_err(|error| io::Error::other(error.to_string()))?;
-            packet.bytes_mut().copy_from_slice(buffer);
-            self.session.send_packet(packet);
-            return Ok(buffer.len());
-        }
-        #[cfg(unix)]
-        let mut packet = [0u8; 2048];
-        #[cfg(unix)]
-        let output = if self.macos_header {
-            if buffer.len() > packet.len() - 4 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "TUN packet exceeds internal buffer",
-                ));
-            }
-            let family: u32 = if buffer.first().is_some_and(|byte| byte >> 4 == 6) {
-                30
-            } else {
-                2
-            };
-            packet[..4].copy_from_slice(&family.to_be_bytes());
-            packet[4..4 + buffer.len()].copy_from_slice(buffer);
-            &packet[..4 + buffer.len()]
-        } else {
-            buffer
-        };
-        #[cfg(unix)]
-        let count = unsafe { libc::write(self.fd, output.as_ptr() as *const c_void, output.len()) };
-        #[cfg(unix)]
-        if count < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(if self.macos_header {
-                (count as usize).saturating_sub(4)
-            } else {
-                count as usize
-            })
-        }
-    }
-}
-impl Drop for Tun {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        unsafe {
-            libc::close(self.fd);
-        }
-    }
+    Ok((network_address, prefix))
 }
 
 fn run_command(program: &str, arguments: &[&str]) -> io::Result<()> {

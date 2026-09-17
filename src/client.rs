@@ -5,10 +5,6 @@ use autobricks_vpn::{
 use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
-#[cfg(windows)]
-use std::os::windows::io::AsRawSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -55,16 +51,6 @@ fn install_signal_handlers() -> io::Result<()> {
     }
 }
 
-#[cfg(unix)]
-fn socket_fd(socket: &std::net::UdpSocket) -> i32 {
-    socket.as_raw_fd()
-}
-
-#[cfg(windows)]
-fn socket_fd(socket: &std::net::UdpSocket) -> usize {
-    socket.as_raw_socket() as usize
-}
-
 fn value(values: &HashMap<String, String>, key: &str, default: &str) -> String {
     values
         .get(key)
@@ -99,45 +85,6 @@ fn boolean_value(values: &HashMap<String, String>, key: &str, default: bool) -> 
     }
 }
 
-#[cfg(unix)]
-fn wait_for_udp(socket: &std::net::UdpSocket, timeout: Duration) -> io::Result<bool> {
-    let mut descriptor = libc::pollfd {
-        fd: socket_fd(socket),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-    let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
-    if result < 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
-            return Ok(true);
-        }
-        Err(error)
-    } else {
-        Ok(result > 0)
-    }
-}
-
-#[cfg(windows)]
-fn wait_for_udp(socket: &std::net::UdpSocket, timeout: Duration) -> io::Result<bool> {
-    let deadline = Instant::now() + timeout;
-    let mut byte = [0u8; 1];
-    while RUNNING.load(Ordering::Relaxed) {
-        match socket.peek(&mut byte) {
-            Ok(_) => return Ok(true),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(error),
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(false);
-        }
-        std::thread::sleep(remaining.min(Duration::from_millis(10)));
-    }
-    Ok(false)
-}
-
 fn connect(
     server: Ipv4Addr,
     port: u16,
@@ -148,16 +95,16 @@ fn connect(
     socket.connect(SocketAddr::from((server, port)))?;
     socket.set_nonblocking(true)?;
     #[cfg(unix)]
-    autobricks_vpn::enlarge_udp_buffers(socket_fd(&socket));
+    autobricks_vpn::enlarge_udp_buffers(crate::platform::socket_handle(&socket));
     eprintln!("[client] UDP connected to {server}:{port}");
 
     let mut dtls = Dtls::new(config)?;
-    dtls.set_socket(socket_fd(&socket))?;
+    dtls.set_socket(crate::platform::socket_handle(&socket))?;
     dtls.set_nonblocking(true);
     let server_peer = socket_addr_storage(SocketAddr::from((server, port)));
     dtls.set_peer(&server_peer, ipv4_socket_addr_size())?;
     let io = DtlsIo::new_client(
-        socket_fd(&socket),
+        crate::platform::socket_handle(&socket),
         server_peer,
         ipv4_socket_addr_size() as _,
     );
@@ -176,7 +123,7 @@ fn connect(
             ));
         }
         let retransmit_timeout = dtls.current_timeout().min(remaining);
-        if !wait_for_udp(&socket, retransmit_timeout)? {
+        if !crate::platform::wait_udp(&socket, retransmit_timeout)? {
             dtls.handle_timeout()?;
         }
     }
@@ -217,45 +164,9 @@ fn run_connection(
     let mut last_server_activity = Instant::now();
 
     while RUNNING.load(Ordering::Relaxed) {
-        #[cfg(unix)]
-        let mut fds = [
-            libc::pollfd {
-                fd: socket_fd(&socket),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: tun.fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
         let until_keepalive = keepalive_interval.saturating_sub(last_keepalive.elapsed());
         let until_dead = liveness_timeout.saturating_sub(last_server_activity.elapsed());
-        let poll_timeout = until_keepalive
-            .min(until_dead)
-            .as_millis()
-            .min(i32::MAX as u128) as i32;
-        #[cfg(unix)]
-        let result = unsafe { libc::poll(fds.as_mut_ptr(), 2, poll_timeout) };
-        #[cfg(unix)]
-        if result < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        #[cfg(unix)]
-        let (tun_ready, socket_ready) = (
-            fds[1].revents & libc::POLLIN != 0,
-            fds[0].revents & libc::POLLIN != 0,
-        );
-        #[cfg(windows)]
-        let (tun_ready, socket_ready) = {
-            std::thread::sleep(Duration::from_millis(poll_timeout.clamp(1, 10) as u64));
-            (true, true)
-        };
+        let ready = crate::platform::wait_io(&socket, tun, until_keepalive.min(until_dead))?;
         if last_server_activity.elapsed() >= liveness_timeout {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -276,7 +187,7 @@ fn run_connection(
                 Err(error) => return Err(error),
             }
         }
-        if tun_ready {
+        if ready.tun {
             // Drain everything queued on the TUN device so a burst of local traffic doesn't
             // each need a separate poll() wakeup, which otherwise delays interactive packets.
             for _ in 0..DRAIN_BATCH_LIMIT {
@@ -300,7 +211,7 @@ fn run_connection(
                 }
             }
         }
-        if socket_ready {
+        if ready.udp {
             for _ in 0..DRAIN_BATCH_LIMIT {
                 let count = match dtls.read(&mut packet) {
                     Ok(count) => count,
