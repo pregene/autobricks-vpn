@@ -1,91 +1,36 @@
 use autobricks_vpn::{
-    ipv4_packet_addresses, ipv4_socket_addr_size, is_keepalive_packet, panic_gate,
-    parse_ini_section, socket_addr_storage, Config, DnsGuard, Dtls, DtlsIo, PacketQueue, Tun,
-    KEEPALIVE_PACKET,
+    base::queue::Queue, base::worker::QueueWorker, ipv4_packet_addresses, ipv4_socket_addr_size,
+    is_keepalive_packet, panic_gate, parse_ini_section, socket_addr_storage, Config, DnsGuard,
+    Dtls, DtlsIo, SynchronizedDtls, Tun, KEEPALIVE_PACKET,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
-/// Caps how many packets are drained per wakeup so one busy fd cannot starve the other.
-const DRAIN_BATCH_LIMIT: u32 = 64;
-const INPUT_PROCESS_BATCH: usize = 32;
-const INPUT_QUEUE_CAPACITY: usize = 512;
-const OUTBOUND_QUEUE_CAPACITY: usize = 256;
-const OUTBOUND_QUEUE_TTL: Duration = Duration::from_secs(2);
-const OUTBOUND_FLUSH_BATCH: usize = 32;
+const SERVER_LIVENESS_TIMEOUT: Duration = Duration::from_secs(23);
+const HEALTH_PROBE_INTERVAL: Duration = Duration::from_secs(20);
+const HEALTH_PROBE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const RETRY_DELAY: Duration = Duration::from_secs(3);
 
-struct QueuedPacket {
-    enqueued_at: Instant,
-    payload: Vec<u8>,
+fn effective_keepalive_interval(configured: Duration) -> Duration {
+    configured.min(HEALTH_PROBE_INTERVAL)
 }
 
-#[derive(Default)]
-struct QueueStats {
-    would_block: u64,
-    expired_drops: u64,
-    overflow_drops: u64,
-    max_depth: usize,
-}
-
-fn expire_queued_packets(queue: &mut VecDeque<QueuedPacket>, stats: &mut QueueStats, now: Instant) {
-    while queue
-        .front()
-        .is_some_and(|packet| now.duration_since(packet.enqueued_at) >= OUTBOUND_QUEUE_TTL)
-    {
-        queue.pop_front();
-        stats.expired_drops = stats.expired_drops.saturating_add(1);
+fn reconnect_delay(error: &io::Error) -> Duration {
+    if error.kind() == io::ErrorKind::TimedOut {
+        Duration::ZERO
+    } else {
+        RETRY_DELAY
     }
-}
-
-fn enqueue_packet(
-    queue: &mut VecDeque<QueuedPacket>,
-    stats: &mut QueueStats,
-    packet: &[u8],
-    now: Instant,
-) {
-    expire_queued_packets(queue, stats, now);
-    if queue.len() >= OUTBOUND_QUEUE_CAPACITY {
-        queue.pop_front();
-        stats.overflow_drops = stats.overflow_drops.saturating_add(1);
-    }
-    queue.push_back(QueuedPacket {
-        enqueued_at: now,
-        payload: packet.to_vec(),
-    });
-    stats.max_depth = stats.max_depth.max(queue.len());
-}
-
-fn flush_outbound_queue(
-    dtls: &mut Dtls,
-    queue: &mut VecDeque<QueuedPacket>,
-    stats: &mut QueueStats,
-) -> io::Result<()> {
-    expire_queued_packets(queue, stats, Instant::now());
-    for _ in 0..OUTBOUND_FLUSH_BATCH {
-        let Some(packet) = queue.front() else {
-            break;
-        };
-        let length = packet.payload.len();
-        match dtls.write(&packet.payload) {
-            Ok(written) if written == length => {
-                queue.pop_front();
-            }
-            Ok(written) => {
-                queue.pop_front();
-                eprintln!("[client] partial queued DTLS write: {written}/{length}; packet dropped");
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                stats.would_block = stats.would_block.saturating_add(1);
-                break;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -127,6 +72,16 @@ fn install_signal_handlers() -> io::Result<()> {
     }
 }
 
+#[cfg(unix)]
+fn socket_fd(socket: &std::net::UdpSocket) -> i32 {
+    socket.as_raw_fd()
+}
+
+#[cfg(windows)]
+fn socket_fd(socket: &std::net::UdpSocket) -> usize {
+    socket.as_raw_socket() as usize
+}
+
 fn value(values: &HashMap<String, String>, key: &str, default: &str) -> String {
     values
         .get(key)
@@ -161,6 +116,45 @@ fn boolean_value(values: &HashMap<String, String>, key: &str, default: bool) -> 
     }
 }
 
+#[cfg(unix)]
+fn wait_for_udp(socket: &std::net::UdpSocket, timeout: Duration) -> io::Result<bool> {
+    let mut descriptor = libc::pollfd {
+        fd: socket_fd(socket),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            return Ok(true);
+        }
+        Err(error)
+    } else {
+        Ok(result > 0)
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_udp(socket: &std::net::UdpSocket, timeout: Duration) -> io::Result<bool> {
+    let deadline = Instant::now() + timeout;
+    let mut byte = [0u8; 1];
+    while RUNNING.load(Ordering::Relaxed) {
+        match socket.peek(&mut byte) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+    Ok(false)
+}
+
 fn connect(
     server: Ipv4Addr,
     port: u16,
@@ -170,17 +164,15 @@ fn connect(
     let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
     socket.connect(SocketAddr::from((server, port)))?;
     socket.set_nonblocking(true)?;
-    #[cfg(unix)]
-    autobricks_vpn::enlarge_udp_buffers(crate::platform::socket_handle(&socket));
     eprintln!("[client] UDP connected to {server}:{port}");
 
     let mut dtls = Dtls::new(config)?;
-    dtls.set_socket(crate::platform::socket_handle(&socket))?;
+    dtls.set_socket(socket_fd(&socket))?;
     dtls.set_nonblocking(true);
     let server_peer = socket_addr_storage(SocketAddr::from((server, port)));
     dtls.set_peer(&server_peer, ipv4_socket_addr_size())?;
     let io = DtlsIo::new_client(
-        crate::platform::socket_handle(&socket),
+        socket_fd(&socket),
         server_peer,
         ipv4_socket_addr_size() as _,
     );
@@ -199,7 +191,7 @@ fn connect(
             ));
         }
         let retransmit_timeout = dtls.current_timeout().min(remaining);
-        if !crate::platform::wait_udp(&socket, retransmit_timeout)? {
+        if !wait_for_udp(&socket, retransmit_timeout)? {
             dtls.handle_timeout()?;
         }
     }
@@ -223,65 +215,232 @@ fn run_connection(
     server: Ipv4Addr,
     port: u16,
     config: &Config,
-    tun: &Tun,
+    tun: &Arc<Tun>,
     keepalive_interval: Duration,
     verify_server_san_ip: bool,
 ) -> io::Result<()> {
     let (socket, mut dtls) = connect(server, port, config, verify_server_san_ip)?;
-    #[cfg(unix)]
-    {
-        // After the handshake, only this loop receives UDP datagrams. wolfSSL consumes
-        // them from a bounded queue instead of reading the socket inside its callback.
-        let server_peer = socket_addr_storage(SocketAddr::from((server, port)));
-        dtls.set_io(DtlsIo::new_queued_client(
-            crate::platform::socket_handle(&socket),
-            server_peer,
-            ipv4_socket_addr_size() as _,
-        ))?;
-    }
-    #[cfg(windows)]
-    let _socket_lifetime_guard = &socket;
+    dtls.use_queued_receive()?;
+    let dtls = Arc::new(SynchronizedDtls::new(dtls));
     println!(
         "Rust VPN client connected to {server}:{port} through {}",
         tun.name()
     );
-    let liveness_timeout = keepalive_interval.saturating_mul(3);
-    let mut packet = [0u8; 2048];
-    let mut last_keepalive = Instant::now();
-    let mut last_server_activity = Instant::now();
-    let mut outbound = VecDeque::with_capacity(OUTBOUND_QUEUE_CAPACITY);
-    let mut tun_inbound = PacketQueue::new(INPUT_QUEUE_CAPACITY);
-    #[cfg(unix)]
-    let mut udp_inbound = PacketQueue::new(INPUT_QUEUE_CAPACITY);
-    let mut queue_stats = QueueStats::default();
+    const QUEUE_CAPACITY: usize = 1024;
+    let keepalive_interval = effective_keepalive_interval(keepalive_interval);
+    let encrypted_queue = Arc::new(Queue::new(QUEUE_CAPACITY).map_err(io::Error::other)?);
+    let plain_queue = Arc::new(Queue::new(QUEUE_CAPACITY).map_err(io::Error::other)?);
+    let active = Arc::new(AtomicBool::new(true));
+    let encrypted_drops = Arc::new(AtomicU64::new(0));
+    let plain_drops = Arc::new(AtomicU64::new(0));
+    let last_server_activity = Arc::new(Mutex::new(Instant::now()));
+    let (error_sender, error_receiver) = mpsc::channel::<io::Error>();
 
-    while RUNNING.load(Ordering::Relaxed) {
-        flush_outbound_queue(&mut dtls, &mut outbound, &mut queue_stats)?;
-        let until_keepalive = keepalive_interval.saturating_sub(last_keepalive.elapsed());
-        let until_dead = liveness_timeout.saturating_sub(last_server_activity.elapsed());
-        let until_queue_expiration = outbound
-            .front()
-            .map(|packet| OUTBOUND_QUEUE_TTL.saturating_sub(packet.enqueued_at.elapsed()))
-            .unwrap_or(Duration::MAX);
-        let ready = crate::platform::wait_io(
-            &socket,
-            tun,
-            until_keepalive.min(until_dead).min(until_queue_expiration),
-            !outbound.is_empty(),
-        )?;
-        if ready.udp_writable {
-            flush_outbound_queue(&mut dtls, &mut outbound, &mut queue_stats)?;
-        }
-        if last_server_activity.elapsed() >= liveness_timeout {
-            return Err(io::Error::new(
+    let udp_socket = socket.try_clone()?;
+    let udp_queue = Arc::clone(&encrypted_queue);
+    let udp_active = Arc::clone(&active);
+    let udp_drops = Arc::clone(&encrypted_drops);
+    let udp_errors = error_sender.clone();
+    let udp_reader = thread::Builder::new()
+        .name("avpn-client-udp-read".to_string())
+        .spawn(move || {
+            let mut packet = [0u8; 2048];
+            while RUNNING.load(Ordering::Acquire) && udp_active.load(Ordering::Acquire) {
+                match wait_for_udp(&udp_socket, Duration::from_millis(100)) {
+                    Ok(false) => continue,
+                    Ok(true) => {}
+                    Err(error) => {
+                        udp_active.store(false, Ordering::Release);
+                        let _ = udp_errors.send(error);
+                        udp_queue.close();
+                        break;
+                    }
+                }
+                loop {
+                    match udp_socket.recv(&mut packet) {
+                        Ok(count) => match udp_queue.push(packet[..count].to_vec()) {
+                            Ok(Some(_)) => {
+                                udp_drops.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Ok(None) => {}
+                            Err(_) => return,
+                        },
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(error) => {
+                            udp_active.store(false, Ordering::Release);
+                            let _ = udp_errors.send(error);
+                            udp_queue.close();
+                            return;
+                        }
+                    }
+                }
+            }
+        })?;
+
+    let tun_reader_device = Arc::clone(tun);
+    let tun_queue = Arc::clone(&plain_queue);
+    let tun_active = Arc::clone(&active);
+    let tun_drops = Arc::clone(&plain_drops);
+    let tun_errors = error_sender.clone();
+    let tun_reader = thread::Builder::new()
+        .name("avpn-client-tun-read".to_string())
+        .spawn(move || {
+            let mut packet = [0u8; 2048];
+            while RUNNING.load(Ordering::Acquire) && tun_active.load(Ordering::Acquire) {
+                #[cfg(unix)]
+                {
+                    let mut descriptor = libc::pollfd {
+                        fd: tun_reader_device.fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let result = unsafe { libc::poll(&mut descriptor, 1, 100) };
+                    if result == 0 {
+                        continue;
+                    }
+                    if result < 0 {
+                        let error = io::Error::last_os_error();
+                        if error.kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        tun_active.store(false, Ordering::Release);
+                        let _ = tun_errors.send(error);
+                        tun_queue.close();
+                        return;
+                    }
+                }
+                match tun_reader_device.read_packet(&mut packet) {
+                    Ok(count) if count > 0 => match tun_queue.push(packet[..count].to_vec()) {
+                        Ok(Some(_)) => {
+                            tun_drops.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(None) => {}
+                        Err(_) => return,
+                    },
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        #[cfg(windows)]
+                        thread::park_timeout(Duration::from_millis(1));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        tun_active.store(false, Ordering::Release);
+                        let _ = tun_errors.send(error);
+                        tun_queue.close();
+                        return;
+                    }
+                }
+            }
+        })?;
+
+    let tun_writer_device = Arc::clone(tun);
+    let decrypt_dtls = Arc::clone(&dtls);
+    let decrypt_active = Arc::clone(&active);
+    let decrypt_plain_queue = Arc::clone(&plain_queue);
+    let decrypt_errors = error_sender.clone();
+    let decrypt_activity = Arc::clone(&last_server_activity);
+    let mut tun_writer = QueueWorker::spawn(
+        "avpn-client-tun-write",
+        Arc::clone(&encrypted_queue),
+        move |datagram| {
+            if !decrypt_active.load(Ordering::Acquire) {
+                return;
+            }
+            let mut packet = [0u8; 2048];
+            let result = panic_gate("client DTLS read worker", || {
+                decrypt_dtls.with(|dtls| {
+                    dtls.push_incoming(datagram)?;
+                    dtls.read(&mut packet)
+                })
+            });
+            let count = match result {
+                Ok(count) => count,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
+                Err(error) => {
+                    decrypt_active.store(false, Ordering::Release);
+                    let _ = decrypt_errors.send(error);
+                    decrypt_plain_queue.close();
+                    return;
+                }
+            };
+            *decrypt_activity
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+            if is_keepalive_packet(&packet[..count]) {
+                return;
+            }
+            if ipv4_packet_addresses(&packet[..count]).is_none() {
+                eprintln!("[client] malformed IPv4 packet from server dropped");
+                return;
+            }
+            if let Err(error) = tun_writer_device.write_packet(&packet[..count]) {
+                decrypt_active.store(false, Ordering::Release);
+                let _ = decrypt_errors.send(error);
+                decrypt_plain_queue.close();
+            }
+        },
+    )?;
+
+    let encrypt_dtls = Arc::clone(&dtls);
+    let encrypt_active = Arc::clone(&active);
+    let encrypt_receive_queue = Arc::clone(&encrypted_queue);
+    let encrypt_errors = error_sender.clone();
+    let mut udp_writer = QueueWorker::spawn(
+        "avpn-client-udp-write",
+        Arc::clone(&plain_queue),
+        move |packet| {
+            if !encrypt_active.load(Ordering::Acquire) {
+                return;
+            }
+            match panic_gate("client DTLS write worker", || {
+                encrypt_dtls.with(|dtls| dtls.write(&packet))
+            }) {
+                Ok(written) if written == packet.len() => {}
+                Ok(written) => eprintln!(
+                    "[client] partial DTLS write: {written}/{} bytes; packet dropped",
+                    packet.len()
+                ),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => {
+                    encrypt_active.store(false, Ordering::Release);
+                    let _ = encrypt_errors.send(error);
+                    encrypt_receive_queue.close();
+                }
+            }
+        },
+    )?;
+
+    let mut last_keepalive = Instant::now();
+    let mut last_probe = Instant::now();
+    let mut probing = false;
+    let mut result = Ok(());
+    while RUNNING.load(Ordering::Acquire) && active.load(Ordering::Acquire) {
+        let server_idle = last_server_activity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .elapsed();
+        if server_idle >= SERVER_LIVENESS_TIMEOUT {
+            result = Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "server did not respond to keepalive",
             ));
+            break;
         }
-        if last_keepalive.elapsed() >= keepalive_interval {
-            match dtls.write(KEEPALIVE_PACKET) {
+        if server_idle < HEALTH_PROBE_INTERVAL {
+            probing = false;
+        }
+        let probe_due = server_idle >= HEALTH_PROBE_INTERVAL
+            && (!probing || last_probe.elapsed() >= HEALTH_PROBE_RETRY_INTERVAL);
+        let keepalive_due = !probing && last_keepalive.elapsed() >= keepalive_interval;
+        if probe_due || keepalive_due {
+            match dtls.with(|dtls| dtls.write(KEEPALIVE_PACKET)) {
                 Ok(written) if written == KEEPALIVE_PACKET.len() => {
                     last_keepalive = Instant::now();
+                    if probe_due {
+                        probing = true;
+                        last_probe = Instant::now();
+                    }
                 }
                 Ok(written) => {
                     return Err(io::Error::other(format!(
@@ -289,106 +448,36 @@ fn run_connection(
                     )));
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error),
-            }
-        }
-        if ready.tun {
-            // Event stage: empty the kernel TUN queue quickly without doing DTLS work here.
-            for _ in 0..DRAIN_BATCH_LIMIT {
-                let count = match tun.read_packet(tun_inbound.write_buffer()) {
-                    Ok(count) => count,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(error) => return Err(error),
-                };
-                if count == 0 {
+                Err(error) => {
+                    result = Err(error);
                     break;
                 }
-                tun_inbound.commit_write(count)?;
             }
         }
-        // Processing stage: bounded work keeps UDP receive, keepalive and queue flush fair.
-        for _ in 0..INPUT_PROCESS_BATCH {
-            let Some(packet) = tun_inbound.front() else {
+        match error_receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(error) => {
+                result = Err(error);
                 break;
-            };
-            if !outbound.is_empty() {
-                enqueue_packet(&mut outbound, &mut queue_stats, packet, Instant::now());
-                tun_inbound.pop_front();
-                continue;
             }
-            match dtls.write(packet) {
-                Ok(written) if written == packet.len() => {}
-                Ok(written) => eprintln!(
-                    "[client] partial DTLS write: {written}/{} bytes; packet dropped",
-                    packet.len()
-                ),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    queue_stats.would_block = queue_stats.would_block.saturating_add(1);
-                    enqueue_packet(&mut outbound, &mut queue_stats, packet, Instant::now());
-                }
-                Err(error) => return Err(error),
-            }
-            tun_inbound.pop_front();
-        }
-        if ready.udp {
-            #[cfg(unix)]
-            for _ in 0..DRAIN_BATCH_LIMIT {
-                let count = match socket.recv(udp_inbound.write_buffer()) {
-                    Ok(count) => count,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(error) => return Err(error),
-                };
-                udp_inbound.commit_write(count)?;
-            }
-            #[cfg(windows)]
-            for _ in 0..DRAIN_BATCH_LIMIT {
-                let count = match dtls.read(&mut packet) {
-                    Ok(count) => count,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(error) => return Err(error),
-                };
-                last_server_activity = Instant::now();
-                if is_keepalive_packet(&packet[..count]) {
-                    continue;
-                }
-                if ipv4_packet_addresses(&packet[..count]).is_some() {
-                    tun.write_packet(&packet[..count])?;
-                } else {
-                    eprintln!("[client] malformed IPv4 packet from server dropped");
-                }
-            }
-        }
-        #[cfg(unix)]
-        for _ in 0..INPUT_PROCESS_BATCH {
-            let Some(datagram) = udp_inbound.front() else {
-                break;
-            };
-            dtls.push_incoming(datagram)?;
-            udp_inbound.pop_front();
-            let count = match dtls.read(&mut packet) {
-                Ok(count) => count,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(error) => return Err(error),
-            };
-            last_server_activity = Instant::now();
-            if is_keepalive_packet(&packet[..count]) {
-                continue;
-            }
-            if ipv4_packet_addresses(&packet[..count]).is_some() {
-                tun.write_packet(&packet[..count])?;
-            } else {
-                eprintln!("[client] malformed IPv4 packet from server dropped");
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    eprintln!(
-        "[client] outbound queue stats: would_block={} expired_drops={} overflow_drops={} max_depth={}",
-        queue_stats.would_block,
-        queue_stats.expired_drops,
-        queue_stats.overflow_drops,
-        queue_stats.max_depth
-    );
-    Ok(())
+    active.store(false, Ordering::Release);
+    encrypted_queue.close();
+    plain_queue.close();
+    let _ = tun_writer.stop();
+    let _ = udp_writer.stop();
+    let _ = udp_reader.join();
+    let _ = tun_reader.join();
+    let encrypted_drops = encrypted_drops.load(Ordering::Relaxed);
+    let plain_drops = plain_drops.load(Ordering::Relaxed);
+    if encrypted_drops > 0 || plain_drops > 0 {
+        eprintln!(
+            "[client] queue overflow drops: encrypted_rx={encrypted_drops}, plain_tx={plain_drops}"
+        );
+    }
+    result
 }
 
 pub(crate) fn run(path: &str) -> io::Result<()> {
@@ -442,7 +531,7 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
         println!("DTLS handshake test succeeded");
         return Ok(());
     }
-    let tun = Tun::open(&value(&values, "tun_name", "autobricks1"))?;
+    let tun = Arc::new(Tun::open(&value(&values, "tun_name", "autobricks1"))?);
     eprintln!("[client] TUN opened: {}", tun.name());
     let vpn_address = value(&values, "vpn_address", "10.8.1.2");
     let vpn_gateway = value(&values, "vpn_gateway", "10.8.1.1");
@@ -459,7 +548,6 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
     if force_dns {
         println!("DNS forced through {dns_server}; previous settings will be restored on exit");
     }
-    let retry_delay = Duration::from_secs(3);
     while RUNNING.load(Ordering::Relaxed) {
         let error = match panic_gate("client connection", || {
             run_connection(
@@ -474,11 +562,43 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
             Ok(()) => return Ok(()),
             Err(error) => error,
         };
-        eprintln!(
-            "[client] connection lost: {error}; retrying in {}s",
-            retry_delay.as_secs()
-        );
-        std::thread::sleep(retry_delay);
+        let delay = reconnect_delay(&error);
+        if delay.is_zero() {
+            eprintln!("[client] connection lost: {error}; reconnecting immediately");
+        } else {
+            eprintln!(
+                "[client] connection lost: {error}; retrying in {}s",
+                delay.as_secs()
+            );
+            std::thread::sleep(delay);
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{effective_keepalive_interval, reconnect_delay};
+    use std::io;
+    use std::time::Duration;
+
+    #[test]
+    fn health_probe_caps_long_keepalive_interval() {
+        assert_eq!(
+            effective_keepalive_interval(Duration::from_secs(30)),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            effective_keepalive_interval(Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn timeout_reconnects_immediately_but_other_failures_back_off() {
+        let timeout = io::Error::from(io::ErrorKind::TimedOut);
+        let failure = io::Error::other("handshake failed");
+        assert_eq!(reconnect_delay(&timeout), Duration::ZERO);
+        assert_eq!(reconnect_delay(&failure), Duration::from_secs(3));
+    }
 }

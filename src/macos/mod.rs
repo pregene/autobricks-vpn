@@ -208,23 +208,30 @@ impl Tun {
     }
 
     pub fn read_packet(&self, buffer: &mut [u8]) -> io::Result<usize> {
-        let mut packet = [0u8; 2048];
-        let count =
-            unsafe { libc::read(self.fd, packet.as_mut_ptr() as *mut c_void, packet.len()) };
+        let mut family = [0u8; 4];
+        let mut vectors = [
+            libc::iovec {
+                iov_base: family.as_mut_ptr() as *mut c_void,
+                iov_len: family.len(),
+            },
+            libc::iovec {
+                iov_base: buffer.as_mut_ptr() as *mut c_void,
+                iov_len: buffer.len(),
+            },
+        ];
+        let count = unsafe { libc::readv(self.fd, vectors.as_mut_ptr(), vectors.len() as i32) };
         if count < 0 {
             return Err(io::Error::last_os_error());
         }
         let count = count as usize;
-        if count <= 4 || count - 4 > buffer.len() {
+        if count <= family.len() || count - family.len() > buffer.len() {
             return Err(io::Error::other("TUN packet too large"));
         }
-        buffer[..count - 4].copy_from_slice(&packet[4..count]);
-        Ok(count - 4)
+        Ok(count - family.len())
     }
 
     pub fn write_packet(&self, buffer: &[u8]) -> io::Result<usize> {
-        let mut packet = [0u8; 2048];
-        if buffer.len() > packet.len() - 4 {
+        if buffer.len() > 2044 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "TUN packet exceeds internal buffer",
@@ -235,14 +242,22 @@ impl Tun {
         } else {
             2
         };
-        packet[..4].copy_from_slice(&family.to_be_bytes());
-        packet[4..4 + buffer.len()].copy_from_slice(buffer);
-        let count =
-            unsafe { libc::write(self.fd, packet.as_ptr() as *const c_void, buffer.len() + 4) };
+        let family = family.to_be_bytes();
+        let vectors = [
+            libc::iovec {
+                iov_base: family.as_ptr() as *mut c_void,
+                iov_len: family.len(),
+            },
+            libc::iovec {
+                iov_base: buffer.as_ptr() as *mut c_void,
+                iov_len: buffer.len(),
+            },
+        ];
+        let count = unsafe { libc::writev(self.fd, vectors.as_ptr(), vectors.len() as i32) };
         if count < 0 {
             Err(io::Error::last_os_error())
         } else {
-            Ok((count as usize).saturating_sub(4))
+            Ok((count as usize).saturating_sub(family.len()))
         }
     }
 }

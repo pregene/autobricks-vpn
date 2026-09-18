@@ -13,23 +13,14 @@ use std::os::fd::RawFd;
 type RawFd = usize;
 use std::process::Command;
 use std::ptr;
+use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 
+pub mod base;
 mod client;
-#[cfg(target_os = "linux")]
-#[path = "linux/mod.rs"]
-mod platform;
-#[cfg(target_os = "macos")]
-#[path = "macos/mod.rs"]
-mod platform;
-#[cfg(windows)]
-#[path = "windows/mod.rs"]
-mod platform;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod server;
-
-pub use platform::Tun;
 
 fn run_from_ffi(config_path: *const c_char, runner: impl FnOnce(&str) -> io::Result<()>) -> c_int {
     if config_path.is_null() {
@@ -135,93 +126,6 @@ const SOCKET_ERROR: c_int = -308;
 pub const KEEPALIVE_PACKET: &[u8] = &[0];
 pub const MIN_TUN_MTU: u16 = 576;
 pub const MAX_TUN_MTU: u16 = 1500;
-pub const PACKET_BUFFER_SIZE: usize = 2048;
-
-struct PacketSlot {
-    bytes: [u8; PACKET_BUFFER_SIZE],
-    length: usize,
-}
-
-/// Fixed-capacity packet ring. Its backing storage is allocated once and reused; packet-path
-/// pushes never allocate. `write_buffer` lets a socket or TUN read directly into the final slot.
-pub struct PacketQueue {
-    slots: Box<[PacketSlot]>,
-    head: usize,
-    length: usize,
-}
-
-impl PacketQueue {
-    pub fn new(capacity: usize) -> Self {
-        let slots = (0..capacity.max(1))
-            .map(|_| PacketSlot {
-                bytes: [0; PACKET_BUFFER_SIZE],
-                length: 0,
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        Self {
-            slots,
-            head: 0,
-            length: 0,
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.length == 0
-    }
-    pub fn len(&self) -> usize {
-        self.length
-    }
-
-    pub fn write_buffer(&mut self) -> &mut [u8] {
-        if self.length == self.slots.len() {
-            self.pop_front();
-        }
-        let index = (self.head + self.length) % self.slots.len();
-        &mut self.slots[index].bytes
-    }
-
-    pub fn commit_write(&mut self, length: usize) -> io::Result<()> {
-        if length > PACKET_BUFFER_SIZE || self.length == self.slots.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid packet ring write",
-            ));
-        }
-        let index = (self.head + self.length) % self.slots.len();
-        self.slots[index].length = length;
-        self.length += 1;
-        Ok(())
-    }
-
-    pub fn push_copy(&mut self, packet: &[u8]) -> io::Result<()> {
-        if packet.len() > PACKET_BUFFER_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "packet exceeds fixed slot",
-            ));
-        }
-        self.write_buffer()[..packet.len()].copy_from_slice(packet);
-        self.commit_write(packet.len())
-    }
-
-    pub fn front(&self) -> Option<&[u8]> {
-        if self.length == 0 {
-            return None;
-        }
-        let slot = &self.slots[self.head];
-        Some(&slot.bytes[..slot.length])
-    }
-
-    pub fn pop_front(&mut self) {
-        if self.length == 0 {
-            return;
-        }
-        self.slots[self.head].length = 0;
-        self.head = (self.head + 1) % self.slots.len();
-        self.length -= 1;
-    }
-}
 
 pub fn is_keepalive_packet(packet: &[u8]) -> bool {
     packet == KEEPALIVE_PACKET
@@ -382,30 +286,6 @@ pub fn validate_private_key_file(path: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Best-effort UDP buffer enlargement to avoid kernel-level (ENOBUFS) drops under bursty
-/// tunnel traffic; the kernel silently clamps this to net.core.[rw]mem_max, so failures here
-/// are non-fatal and intentionally ignored.
-#[cfg(unix)]
-pub fn enlarge_udp_buffers(fd: RawFd) {
-    const BUFFER_BYTES: c_int = 4 * 1024 * 1024;
-    unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &BUFFER_BYTES as *const c_int as *const c_void,
-            mem::size_of::<c_int>() as libc::socklen_t,
-        );
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            &BUFFER_BYTES as *const c_int as *const c_void,
-            mem::size_of::<c_int>() as libc::socklen_t,
-        );
-    }
-}
-
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TunErrorAction {
@@ -478,6 +358,8 @@ extern "C" {
         kind: c_int,
         monitor: c_int,
     ) -> c_int;
+    #[cfg(target_os = "macos")]
+    fn wolfSSL_CTX_dtls_set_mtu(ctx: *mut WolfCtx, mtu: u16) -> c_int;
     #[cfg(feature = "dtls13")]
     fn wolfDTLSv1_3_server_method() -> *mut WolfMethod;
     #[cfg(feature = "dtls13")]
@@ -543,6 +425,41 @@ pub struct Dtls {
     io: Option<Box<DtlsIo>>,
     server: bool,
     nonblocking: bool,
+}
+
+// SAFETY: `Dtls` exclusively owns its wolfSSL pointers and callback context.
+// Moving that ownership to another thread is safe. Concurrent access is not
+// allowed through `Dtls`; use `SynchronizedDtls` when sharing a session.
+unsafe impl Send for Dtls {}
+
+/// Serializes every access to one wolfSSL session object.
+///
+/// Network and TUN readers must not hold this mutex while waiting for I/O. They
+/// enqueue packets first; only the worker's wolfSSL operation runs under `with`.
+pub struct SynchronizedDtls {
+    inner: Mutex<Dtls>,
+}
+
+impl SynchronizedDtls {
+    pub fn new(dtls: Dtls) -> Self {
+        Self {
+            inner: Mutex::new(dtls),
+        }
+    }
+
+    pub fn with<R>(&self, operation: impl FnOnce(&mut Dtls) -> R) -> R {
+        let mut dtls = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        operation(&mut dtls)
+    }
+
+    pub fn into_inner(self) -> Dtls {
+        self.inner
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 impl Dtls {
@@ -647,10 +564,10 @@ impl Dtls {
                     ));
                 }
             }
-            // `config.mtu` is the inner TUN MTU, not the outer DTLS datagram MTU.
-            // Applying the same value to wolfSSL leaves no room for the DTLS record
-            // header and authentication tag and makes full-sized tunnel packets fail
-            // with DTLS_SIZE_ERROR. Keep wolfSSL's transport-MTU default instead.
+            #[cfg(target_os = "macos")]
+            if config.mtu > 0 {
+                wolfSSL_CTX_dtls_set_mtu(ctx, config.mtu);
+            }
             Ok(Self {
                 ctx,
                 ssl: ptr::null_mut(),
@@ -713,7 +630,7 @@ impl Dtls {
         Ok(())
     }
 
-    pub fn push_incoming(&mut self, packet: &[u8]) -> io::Result<()> {
+    pub fn push_incoming(&mut self, packet: Vec<u8>) -> io::Result<()> {
         let io = self
             .io
             .as_mut()
@@ -723,14 +640,24 @@ impl Dtls {
                 "cannot queue packets for a connected DTLS socket",
             ));
         }
-        io.incoming.push_copy(packet)
+        io.incoming.push_back(packet);
+        Ok(())
+    }
+
+    pub fn use_queued_receive(&mut self) -> io::Result<()> {
+        let io = self
+            .io
+            .as_mut()
+            .ok_or_else(|| io::Error::other("DTLS I/O is not initialized"))?;
+        io.direct_receive = false;
+        Ok(())
     }
 
     pub fn set_incoming_peer(
         &mut self,
         peer: SocketAddrStorage,
         peer_size: SocketLength,
-        packet: &[u8],
+        packet: Vec<u8>,
     ) -> io::Result<()> {
         self.set_peer(&peer, peer_size as usize)?;
         let io = self
@@ -744,10 +671,9 @@ impl Dtls {
         }
         io.peer = peer;
         io.peer_size = peer_size;
-        while !io.incoming.is_empty() {
-            io.incoming.pop_front();
-        }
-        io.incoming.push_copy(packet)
+        io.incoming.clear();
+        io.incoming.push_back(packet);
+        Ok(())
     }
 
     pub fn accept_stateless(&mut self) -> io::Result<bool> {
@@ -978,7 +904,7 @@ pub struct DtlsIo {
     peer_size: SocketLength,
     direct_receive: bool,
     connected_send: bool,
-    incoming: PacketQueue,
+    incoming: VecDeque<Vec<u8>>,
 }
 
 impl DtlsIo {
@@ -989,7 +915,7 @@ impl DtlsIo {
             peer_size,
             direct_receive: false,
             connected_send: false,
-            incoming: PacketQueue::new(256),
+            incoming: VecDeque::new(),
         }
     }
 
@@ -1000,23 +926,12 @@ impl DtlsIo {
             peer_size,
             direct_receive: true,
             connected_send: true,
-            incoming: PacketQueue::new(256),
+            incoming: VecDeque::new(),
         }
     }
 
-    pub fn new_queued_client(fd: RawFd, peer: SocketAddrStorage, peer_size: SocketLength) -> Self {
-        Self {
-            fd,
-            peer,
-            peer_size,
-            direct_receive: false,
-            connected_send: true,
-            incoming: PacketQueue::new(256),
-        }
-    }
-
-    pub fn push(&mut self, packet: &[u8]) -> io::Result<()> {
-        self.incoming.push_copy(packet)
+    pub fn push(&mut self, packet: Vec<u8>) {
+        self.incoming.push_back(packet);
     }
 }
 
@@ -1041,16 +956,14 @@ unsafe extern "C" fn dtls_recv(
         let result = recv(io.fd, buffer, size, 0) as isize;
         return if result < 0 { -2 } else { result as c_int };
     }
-    let Some(packet) = io.incoming.front() else {
+    let Some(packet) = io.incoming.pop_front() else {
         return -2;
     };
     if packet.len() > size as usize {
         return -1;
     }
     ptr::copy_nonoverlapping(packet.as_ptr(), buffer as *mut u8, packet.len());
-    let length = packet.len() as c_int;
-    io.incoming.pop_front();
-    length
+    packet.len() as c_int
 }
 
 unsafe extern "C" fn dtls_send(
@@ -1093,6 +1006,14 @@ unsafe extern "C" fn dtls_send(
     }
 }
 
+pub struct Tun {
+    fd: RawFd,
+    macos_header: bool,
+    name: String,
+    #[cfg(windows)]
+    session: std::sync::Arc<wintun::Session>,
+}
+
 pub struct ForwardingGuard {
     #[cfg(target_os = "linux")]
     interface: String,
@@ -1105,9 +1026,9 @@ impl ForwardingGuard {
         #[cfg(target_os = "linux")]
         {
             run_command("sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
-            // VPN clients share one TUN interface but cannot reach each other directly.
-            // Linux otherwise emits misleading ICMP Redirect Host messages when it
-            // forwards a packet back out through that same interface.
+            // VPN clients share one TUN interface but cannot reach each other at
+            // layer 2. A redirect would therefore advertise an unusable direct
+            // path and must remain disabled whenever the interface is recreated.
             run_command(
                 "sysctl",
                 &["-w", &format!("net.ipv4.conf.{interface}.send_redirects=0")],
@@ -1347,24 +1268,400 @@ impl Drop for DnsGuard {
     }
 }
 
-fn validate_tun_ipv4<'a>(address: &str, peer: &str, network: &'a str) -> io::Result<(&'a str, u8)> {
-    let (network_address, prefix) = network
-        .split_once('/')
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "network must be CIDR"))?;
-    let prefix: u8 = prefix
-        .parse()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid network prefix"))?;
-    if prefix > 32
-        || address.parse::<Ipv4Addr>().is_err()
-        || peer.parse::<Ipv4Addr>().is_err()
-        || network_address.parse::<Ipv4Addr>().is_err()
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid IPv4 TUN configuration",
-        ));
+impl Tun {
+    pub fn open(requested_name: &str) -> io::Result<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            Self::open_utun(requested_name)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            Self::open_linux(requested_name)
+        }
+        #[cfg(windows)]
+        {
+            Self::open_windows(requested_name)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        {
+            let _ = requested_name;
+            Err(io::Error::other("TUN is unsupported on this platform"))
+        }
     }
-    Ok((network_address, prefix))
+
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::manual_c_str_literals)]
+    fn open_utun(_requested_name: &str) -> io::Result<Self> {
+        const CTL_NAME: &[u8] = b"com.apple.net.utun_control\0";
+        #[repr(C)]
+        struct CtlInfo {
+            ctl_id: u32,
+            ctl_name: [u8; 96],
+        }
+        #[repr(C)]
+        struct SockAddrCtl {
+            sc_len: u8,
+            sc_family: u8,
+            ss_sysaddr: u16,
+            sc_id: u32,
+            sc_unit: u32,
+            sc_reserved: [u32; 5],
+        }
+        let mut info = CtlInfo {
+            ctl_name: [0; 96],
+            ctl_id: 0,
+        };
+        info.ctl_name[..CTL_NAME.len()].copy_from_slice(CTL_NAME);
+        unsafe {
+            let fd = libc::socket(32, libc::SOCK_DGRAM, 2);
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::ioctl(fd, 0xc0644e03u64, &mut info) < 0 {
+                let error = io::Error::last_os_error();
+                libc::close(fd);
+                return Err(error);
+            }
+            let address = SockAddrCtl {
+                sc_len: mem::size_of::<SockAddrCtl>() as u8,
+                sc_family: 32,
+                ss_sysaddr: 2,
+                sc_id: info.ctl_id,
+                sc_unit: 0,
+                sc_reserved: [0; 5],
+            };
+            if libc::connect(
+                fd,
+                &address as *const _ as *const libc::sockaddr,
+                mem::size_of::<SockAddrCtl>() as u32,
+            ) < 0
+            {
+                let error = io::Error::last_os_error();
+                libc::close(fd);
+                return Err(error);
+            }
+            let mut name = [0u8; 16];
+            let mut name_len = name.len() as libc::socklen_t;
+            if libc::getsockopt(fd, 2, 2, name.as_mut_ptr() as *mut c_void, &mut name_len) < 0 {
+                let error = io::Error::last_os_error();
+                libc::close(fd);
+                return Err(error);
+            }
+            let name = CStr::from_bytes_until_nul(&name)
+                .unwrap_or(CStr::from_bytes_with_nul(b"utun\0").unwrap())
+                .to_string_lossy()
+                .into_owned();
+            Ok(Self {
+                fd,
+                macos_header: true,
+                name,
+            })
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_linux(requested_name: &str) -> io::Result<Self> {
+        #[repr(C)]
+        struct IfReq {
+            name: [u8; libc::IFNAMSIZ],
+            flags: libc::c_short,
+            padding: [u8; 22],
+        }
+        const TUNSETIFF: libc::c_ulong = 0x400454ca;
+        const IFF_TUN: libc::c_short = 0x0001;
+        const IFF_NO_PI: libc::c_short = 0x1000;
+        let fd = unsafe { libc::open(b"/dev/net/tun\0".as_ptr() as *const c_char, libc::O_RDWR) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut request = IfReq {
+            name: [0; libc::IFNAMSIZ],
+            flags: IFF_TUN | IFF_NO_PI,
+            padding: [0; 22],
+        };
+        for (slot, byte) in request.name.iter_mut().zip(requested_name.bytes()) {
+            *slot = byte;
+        }
+        if unsafe { libc::ioctl(fd, TUNSETIFF, &mut request) } < 0 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(error);
+        }
+        let name = String::from_utf8_lossy(&request.name)
+            .trim_end_matches('\0')
+            .to_string();
+        Ok(Self {
+            fd,
+            macos_header: false,
+            name,
+        })
+    }
+
+    #[cfg(windows)]
+    fn open_windows(requested_name: &str) -> io::Result<Self> {
+        let dll = std::env::var("WINTUN_DLL").unwrap_or_else(|_| "wintun.dll".to_string());
+        let wintun = unsafe { wintun::load_from_path(dll) }
+            .map_err(|error| io::Error::other(format!("loading Wintun: {error}")))?;
+        let adapter = wintun::Adapter::open(&wintun, requested_name)
+            .or_else(|_| wintun::Adapter::create(&wintun, requested_name, "autobricks-vpn", None))
+            .map_err(|error| io::Error::other(format!("opening Wintun adapter: {error}")))?;
+        let session = std::sync::Arc::new(
+            adapter
+                .start_session(wintun::MAX_RING_CAPACITY)
+                .map_err(|error| io::Error::other(format!("starting Wintun session: {error}")))?,
+        );
+        Ok(Self {
+            fd: 0,
+            macos_header: false,
+            name: requested_name.to_string(),
+            session,
+        })
+    }
+
+    pub fn fd(&self) -> RawFd {
+        self.fd
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn configure_mtu(&self, mtu: u16) -> io::Result<()> {
+        validate_mtu(mtu)?;
+        #[cfg(target_os = "macos")]
+        {
+            run_command("ifconfig", &[&self.name, "mtu", &mtu.to_string()])
+        }
+        #[cfg(target_os = "linux")]
+        {
+            run_command(
+                "ip",
+                &["link", "set", "dev", &self.name, "mtu", &mtu.to_string()],
+            )
+        }
+        #[cfg(windows)]
+        {
+            run_command(
+                "netsh",
+                &[
+                    "interface",
+                    "ipv4",
+                    "set",
+                    "subinterface",
+                    &self.name,
+                    &format!("mtu={mtu}"),
+                    "store=active",
+                ],
+            )
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        {
+            let _ = mtu;
+            Err(io::Error::other(
+                "TUN MTU configuration is unsupported on this platform",
+            ))
+        }
+    }
+    pub fn configure_ipv4(&self, address: &str, peer: &str, network: &str) -> io::Result<()> {
+        let (network_address, prefix) = network
+            .split_once('/')
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "network must be CIDR"))?;
+        let prefix: u8 = prefix
+            .parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid network prefix"))?;
+        if prefix > 32
+            || address.parse::<Ipv4Addr>().is_err()
+            || peer.parse::<Ipv4Addr>().is_err()
+            || network_address.parse::<Ipv4Addr>().is_err()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid IPv4 TUN configuration",
+            ));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mask = Ipv4Addr::from(if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            });
+            run_command(
+                "ifconfig",
+                &[
+                    &self.name,
+                    address,
+                    peer,
+                    "netmask",
+                    &mask.to_string(),
+                    "up",
+                ],
+            )?;
+            run_command(
+                "route",
+                &[
+                    "-n",
+                    "add",
+                    "-net",
+                    network_address,
+                    "-netmask",
+                    &mask.to_string(),
+                    "-interface",
+                    &self.name,
+                ],
+            )
+        }
+        #[cfg(target_os = "linux")]
+        {
+            run_command(
+                "ip",
+                &[
+                    "addr",
+                    "replace",
+                    &format!("{address}/{prefix}"),
+                    "dev",
+                    &self.name,
+                ],
+            )?;
+            run_command("ip", &["link", "set", "dev", &self.name, "up"])?;
+            run_command("ip", &["route", "replace", network, "dev", &self.name])
+        }
+        #[cfg(windows)]
+        {
+            let mask = Ipv4Addr::from(if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            });
+            run_command(
+                "netsh",
+                &[
+                    "interface",
+                    "ip",
+                    "set",
+                    "address",
+                    &format!("name={}", self.name),
+                    "static",
+                    address,
+                    &mask.to_string(),
+                    peer,
+                ],
+            )?;
+            run_command(
+                "route",
+                &["ADD", network_address, "MASK", &mask.to_string(), peer],
+            )
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        {
+            let _ = (address, peer, network);
+            Err(io::Error::other(
+                "TUN configuration is unsupported on this platform",
+            ))
+        }
+    }
+    pub fn read_packet(&self, buffer: &mut [u8]) -> io::Result<usize> {
+        #[cfg(windows)]
+        {
+            return match self
+                .session
+                .try_receive()
+                .map_err(|error| io::Error::other(error.to_string()))?
+            {
+                Some(packet) if packet.bytes().len() <= buffer.len() => {
+                    buffer[..packet.bytes().len()].copy_from_slice(packet.bytes());
+                    Ok(packet.bytes().len())
+                }
+                Some(_) => Err(io::Error::other("TUN packet too large")),
+                None => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            };
+        }
+        #[cfg(unix)]
+        let mut packet = [0u8; 2048];
+        #[cfg(unix)]
+        let target_ptr = if self.macos_header {
+            packet.as_mut_ptr()
+        } else {
+            buffer.as_mut_ptr()
+        };
+        #[cfg(unix)]
+        let target_len = if self.macos_header {
+            packet.len()
+        } else {
+            buffer.len()
+        };
+        #[cfg(unix)]
+        let count = unsafe { libc::read(self.fd, target_ptr as *mut c_void, target_len) };
+        #[cfg(unix)]
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        #[cfg(unix)]
+        let count = count as usize;
+        #[cfg(unix)]
+        if self.macos_header {
+            if count <= 4 || count - 4 > buffer.len() {
+                return Err(io::Error::other("TUN packet too large"));
+            }
+            buffer[..count - 4].copy_from_slice(&packet[4..count]);
+            Ok(count - 4)
+        } else {
+            Ok(count)
+        }
+    }
+    pub fn write_packet(&self, buffer: &[u8]) -> io::Result<usize> {
+        #[cfg(windows)]
+        {
+            let mut packet = self
+                .session
+                .allocate_send_packet(buffer.len() as u16)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            packet.bytes_mut().copy_from_slice(buffer);
+            self.session.send_packet(packet);
+            return Ok(buffer.len());
+        }
+        #[cfg(unix)]
+        let mut packet = [0u8; 2048];
+        #[cfg(unix)]
+        let output = if self.macos_header {
+            if buffer.len() > packet.len() - 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "TUN packet exceeds internal buffer",
+                ));
+            }
+            let family: u32 = if buffer.first().is_some_and(|byte| byte >> 4 == 6) {
+                30
+            } else {
+                2
+            };
+            packet[..4].copy_from_slice(&family.to_be_bytes());
+            packet[4..4 + buffer.len()].copy_from_slice(buffer);
+            &packet[..4 + buffer.len()]
+        } else {
+            buffer
+        };
+        #[cfg(unix)]
+        let count = unsafe { libc::write(self.fd, output.as_ptr() as *const c_void, output.len()) };
+        #[cfg(unix)]
+        if count < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(if self.macos_header {
+                (count as usize).saturating_sub(4)
+            } else {
+                count as usize
+            })
+        }
+    }
+}
+impl Drop for Tun {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
 }
 
 fn run_command(program: &str, arguments: &[&str]) -> io::Result<()> {
@@ -1582,7 +1879,7 @@ mod tests {
     use super::{
         ipv4_in_cidr, ipv4_is_broadcast, ipv4_packet_addresses, normalize_sha256_fingerprint,
         panic_gate, parse_ipv4_cidr, validate_client_bindings, validate_datagram_write,
-        validate_private_key_file, IpRateLimiter, PacketQueue, RateLimitDecision,
+        validate_private_key_file, IpRateLimiter, RateLimitDecision,
     };
     use std::io;
     use std::net::Ipv4Addr;
@@ -1593,24 +1890,65 @@ mod tests {
 
     #[test]
     fn panic_gate_returns_success_value() {
-        assert_eq!(panic_gate("success", || Ok(42)).unwrap(), 42);
+        eprintln!("[panic-gate] case=success start");
+        let value = panic_gate("success", || Ok(42)).unwrap();
+        eprintln!("[panic-gate] case=success result=ok value={value}");
+        assert_eq!(value, 42);
     }
 
     #[test]
     fn panic_gate_preserves_regular_error() {
+        eprintln!("[panic-gate] case=regular-error start");
         let error = panic_gate::<()>("regular error", || {
             Err(io::Error::new(io::ErrorKind::InvalidData, "bad packet"))
         })
         .unwrap_err();
+        eprintln!(
+            "[panic-gate] case=regular-error result=preserved kind={:?} message={error}",
+            error.kind()
+        );
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), "bad packet");
     }
 
     #[test]
     fn panic_gate_converts_panic_to_error() {
+        eprintln!("[panic-gate] case=string-panic start");
         let error = panic_gate::<()>("client packet", || panic!("malformed input")).unwrap_err();
+        eprintln!(
+            "[panic-gate] case=string-panic result=contained kind={:?} message={error}",
+            error.kind()
+        );
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert_eq!(error.to_string(), "client packet panicked: malformed input");
+    }
+
+    #[test]
+    fn panic_gate_handles_non_string_panic_payload() {
+        eprintln!("[panic-gate] case=non-string-panic start");
+        let error = panic_gate::<()>("worker", || std::panic::panic_any(7_u32)).unwrap_err();
+        eprintln!(
+            "[panic-gate] case=non-string-panic result=contained kind={:?} message={error}",
+            error.kind()
+        );
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "worker panicked: unknown panic");
+    }
+
+    #[test]
+    fn panic_gate_remains_usable_after_containing_panic() {
+        eprintln!("[panic-gate] case=recovery start");
+        assert!(panic_gate::<()>("first packet", || panic!("invalid packet")).is_err());
+        eprintln!("[panic-gate] case=recovery first-result=contained");
+        let value = panic_gate("next packet", || Ok(42)).unwrap();
+        eprintln!("[panic-gate] case=recovery second-result=ok value={value}");
+        assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn synchronized_dtls_can_be_shared_between_io_workers() {
+        fn assert_send_and_sync<T: Send + Sync>() {}
+        assert_send_and_sync::<super::SynchronizedDtls>();
     }
 
     #[test]
@@ -1619,18 +1957,6 @@ mod tests {
         let error = validate_datagram_write(0, 1).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::WriteZero);
         assert_eq!(error.to_string(), "partial datagram write: 0/1 bytes");
-    }
-
-    #[test]
-    fn fixed_packet_queue_reuses_slots_and_drops_oldest_when_full() {
-        let mut queue = PacketQueue::new(2);
-        queue.push_copy(b"one").unwrap();
-        queue.push_copy(b"two").unwrap();
-        queue.push_copy(b"three").unwrap();
-        assert_eq!(queue.len(), 2);
-        assert_eq!(queue.front(), Some(&b"two"[..]));
-        queue.pop_front();
-        assert_eq!(queue.front(), Some(&b"three"[..]));
     }
 
     #[test]

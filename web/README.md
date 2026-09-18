@@ -10,7 +10,7 @@ npm install
 npm run dev
 ```
 
-주소는 `server.ini`의 `[server] port`를 읽어 `127.0.0.1`에만 TCP로 엽니다. 현재 설정에서는 `http://127.0.0.1:4433`입니다. VPN 서버는 같은 번호의 UDP 포트를 사용하므로 서로 충돌하지 않습니다.
+주소는 `server.ini`의 `[server] port`를 읽어 `127.0.0.1`에만 TCP로 엽니다. VPN 서버는 같은 번호의 UDP 포트를 사용하므로 서로 충돌하지 않습니다.
 
 ```sh
 VPN_CONFIG=/etc/autobricks-vpn/server.ini npm start
