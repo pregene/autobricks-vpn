@@ -23,6 +23,7 @@ target/
 build/
 *.dSYM/
 .DS_Store
+.obsidian/
 certs/
 docs/
 release/
