@@ -1,16 +1,20 @@
 use autobricks_vpn::{
     ipv4_destination, ipv4_in_cidr, ipv4_is_broadcast, ipv4_packet_addresses, is_keepalive_packet,
     panic_gate, parse_ini_entries, parse_ini_section, parse_ipv4_cidr, validate_client_bindings,
-    validate_datagram_write, Config, Dtls, DtlsIo, ForwardingGuard, IpRateLimiter,
-    RateLimitDecision, Tun, TunErrorAction, KEEPALIVE_PACKET,
+    validate_datagram_write, Config, Dtls, DtlsIo, ForwardingGuard, IpRateLimiter, PacketQueue,
+    RateLimitDecision, Tun, TunErrorAction, KEEPALIVE_PACKET, PACKET_BUFFER_SIZE,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::mem;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::ops::Deref;
 use std::os::fd::RawFd;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -20,9 +24,131 @@ compile_error!("vpn-server supports Linux and macOS only");
 static RUNNING: AtomicBool = AtomicBool::new(true);
 /// Caps how many packets are drained per wakeup so one busy fd cannot starve the other.
 const DRAIN_BATCH_LIMIT: u32 = 64;
+/// UDP work is capped lower than TUN work so inbound ACK bursts cannot starve downloads.
+const UDP_DRAIN_BATCH_LIMIT: u32 = 16;
+const INPUT_PROCESS_BATCH: usize = 32;
+const INPUT_QUEUE_CAPACITY: usize = 1024;
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PENDING_PER_IP: usize = 2;
+const OUTBOUND_QUEUE_CAPACITY: usize = 256;
+const OUTBOUND_QUEUE_TTL: Duration = Duration::from_secs(2);
+const OUTBOUND_FLUSH_BATCH: usize = 32;
+
+type PeerKey = (Ipv4Addr, u16);
+
+struct QueuedPacketSlot {
+    enqueued_at: Instant,
+    payload: [u8; PACKET_BUFFER_SIZE],
+    length: usize,
+}
+
+struct OutboundQueue {
+    slots: Box<[QueuedPacketSlot]>,
+    head: usize,
+    length: usize,
+}
+
+impl OutboundQueue {
+    fn new(capacity: usize) -> Self {
+        let now = Instant::now();
+        let slots = (0..capacity.max(1))
+            .map(|_| QueuedPacketSlot {
+                enqueued_at: now,
+                payload: [0; PACKET_BUFFER_SIZE],
+                length: 0,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            slots,
+            head: 0,
+            length: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+    fn front(&self) -> Option<&QueuedPacketSlot> {
+        (self.length != 0).then(|| &self.slots[self.head])
+    }
+    fn pop_front(&mut self) {
+        if self.length == 0 {
+            return;
+        }
+        self.slots[self.head].length = 0;
+        self.head = (self.head + 1) % self.slots.len();
+        self.length -= 1;
+    }
+    fn push_copy(&mut self, packet: &[u8], now: Instant) -> io::Result<bool> {
+        if packet.len() > PACKET_BUFFER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "packet exceeds fixed slot",
+            ));
+        }
+        let overflow = self.length == self.slots.len();
+        if overflow {
+            self.pop_front();
+        }
+        let index = (self.head + self.length) % self.slots.len();
+        let slot = &mut self.slots[index];
+        slot.payload[..packet.len()].copy_from_slice(packet);
+        slot.length = packet.len();
+        slot.enqueued_at = now;
+        self.length += 1;
+        Ok(overflow)
+    }
+}
+
+struct IncomingDatagram {
+    peer: libc::sockaddr_storage,
+    peer_size: libc::socklen_t,
+    payload: [u8; PACKET_BUFFER_SIZE],
+    length: usize,
+}
+
+impl IncomingDatagram {
+    fn new() -> Self {
+        Self {
+            peer: unsafe { mem::zeroed() },
+            peer_size: 0,
+            payload: [0; PACKET_BUFFER_SIZE],
+            length: 0,
+        }
+    }
+}
+
+struct DatagramLease<'a> {
+    datagram: Option<Box<IncomingDatagram>>,
+    free: &'a mut VecDeque<Box<IncomingDatagram>>,
+}
+
+impl<'a> DatagramLease<'a> {
+    fn new(datagram: Box<IncomingDatagram>, free: &'a mut VecDeque<Box<IncomingDatagram>>) -> Self {
+        Self {
+            datagram: Some(datagram),
+            free,
+        }
+    }
+}
+
+impl Deref for DatagramLease<'_> {
+    type Target = IncomingDatagram;
+
+    fn deref(&self) -> &Self::Target {
+        self.datagram.as_deref().expect("datagram lease is valid")
+    }
+}
+
+impl Drop for DatagramLease<'_> {
+    fn drop(&mut self) {
+        if let Some(datagram) = self.datagram.take() {
+            self.free.push_back(datagram);
+        }
+    }
+}
 
 #[cfg(unix)]
 extern "C" fn stop(_signal: libc::c_int) {
@@ -53,7 +179,152 @@ struct Session {
     bytes_rx: u64,
     packets_tx: u64,
     packets_rx: u64,
+    outbound: OutboundQueue,
+    queue_expired_drops: u64,
+    queue_overflow_drops: u64,
     disconnect_reason: &'static str,
+}
+
+struct ControlSocket {
+    listener: UnixListener,
+    path: String,
+    watchers: Vec<UnixStream>,
+    last_identity: String,
+    identity_scratch: String,
+}
+
+impl ControlSocket {
+    fn bind(path: String) -> io::Result<Self> {
+        match UnixStream::connect(&path) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "control socket is already active",
+                ))
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::ConnectionRefused
+                    || error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if std::path::Path::new(&path).exists() {
+            std::fs::remove_file(&path)?;
+        }
+        let listener = UnixListener::bind(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))?;
+        listener.set_nonblocking(true)?;
+        Ok(Self {
+            listener,
+            path,
+            watchers: Vec::new(),
+            last_identity: String::new(),
+            identity_scratch: String::with_capacity(4096),
+        })
+    }
+
+    fn process(&mut self, sessions: &mut Vec<Session>) -> io::Result<()> {
+        loop {
+            let (mut stream, _) = match self.listener.accept() {
+                Ok(value) => value,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            };
+            let mut command = [0u8; 256];
+            let count = stream.read(&mut command)?;
+            let command = String::from_utf8_lossy(&command[..count]);
+            let command = command.trim();
+            if command == "WATCH" {
+                let snapshot = session_snapshot(sessions);
+                stream.write_all(snapshot.as_bytes())?;
+                stream.write_all(b"\n")?;
+                stream.set_nonblocking(true)?;
+                self.watchers.push(stream);
+            } else if command == "STATUS" {
+                let snapshot = session_snapshot(sessions);
+                stream.write_all(snapshot.as_bytes())?;
+                stream.write_all(b"\n")?;
+            } else if let Some(address) = command.strip_prefix("DISCONNECT ") {
+                let address = address.parse::<Ipv4Addr>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid VPN address")
+                })?;
+                let before = sessions.len();
+                sessions.retain_mut(|session| {
+                    if session.established && session.address == address {
+                        session.disconnect_reason = "web_disconnect";
+                        false
+                    } else {
+                        true
+                    }
+                });
+                let removed = before - sessions.len();
+                stream.write_all(
+                    format!("{{\"ok\":true,\"disconnected\":{removed}}}\n").as_bytes(),
+                )?;
+            } else {
+                stream.write_all(b"{\"ok\":false,\"error\":\"invalid_command\"}\n")?;
+            }
+        }
+        self.publish_if_changed(sessions);
+        Ok(())
+    }
+
+    fn publish_if_changed(&mut self, sessions: &[Session]) {
+        self.identity_scratch.clear();
+        write_session_identity(&mut self.identity_scratch, sessions);
+        if self.identity_scratch == self.last_identity {
+            return;
+        }
+        mem::swap(&mut self.identity_scratch, &mut self.last_identity);
+        let snapshot = session_snapshot(sessions);
+        let message = format!("{snapshot}\n");
+        self.watchers
+            .retain_mut(|stream| match stream.write_all(message.as_bytes()) {
+                Ok(()) => true,
+                Err(error) => error.kind() == io::ErrorKind::WouldBlock,
+            });
+    }
+}
+
+fn write_session_identity(output: &mut String, sessions: &[Session]) {
+    for session in sessions.iter().filter(|session| session.established) {
+        let _ = write!(
+            output,
+            "{}:{}|",
+            session.address,
+            session.fingerprint.as_deref().unwrap_or("")
+        );
+    }
+}
+
+impl Drop for ControlSocket {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn session_snapshot(sessions: &[Session]) -> String {
+    let mut output = String::with_capacity(256 + sessions.len() * 256);
+    output.push_str("{\"type\":\"sessions\",\"sessions\":[");
+    let mut first = true;
+    for session in sessions.iter().filter(|session| session.established) {
+        if !first {
+            output.push(',');
+        }
+        first = false;
+        let _ = write!(
+            output,
+            "{{\"vpnAddress\":\"{}\",\"fingerprint\":\"{}\",\"connectedSeconds\":{},\"bytesTx\":{},\"bytesRx\":{},\"packetsTx\":{},\"packetsRx\":{}}}",
+            session.address,
+            session.fingerprint.as_deref().unwrap_or(""),
+            session.established_at.map(|value| value.elapsed().as_secs()).unwrap_or(0),
+            session.bytes_tx,
+            session.bytes_rx,
+            session.packets_tx,
+            session.packets_rx
+        );
+    }
+    output.push_str("]}");
+    output
 }
 
 impl Drop for Session {
@@ -149,34 +420,25 @@ fn boolean_value(values: &HashMap<String, String>, key: &str, default: bool) -> 
     }
 }
 
-fn receive_peer(fd: RawFd) -> io::Result<(libc::sockaddr_storage, libc::socklen_t, Vec<u8>)> {
-    let mut peer: libc::sockaddr_storage = unsafe { mem::zeroed() };
+fn receive_peer(fd: RawFd, datagram: &mut IncomingDatagram) -> io::Result<()> {
+    datagram.peer = unsafe { mem::zeroed() };
     let mut length = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    let mut packet = [0u8; 2048];
     let result = unsafe {
         libc::recvfrom(
             fd,
-            packet.as_mut_ptr() as *mut _,
-            packet.len(),
+            datagram.payload.as_mut_ptr() as *mut _,
+            datagram.payload.len(),
             0,
-            &mut peer as *mut _ as *mut _,
+            &mut datagram.peer as *mut _ as *mut _,
             &mut length,
         )
     };
     if result < 0 {
         Err(io::Error::last_os_error())
     } else {
-        Ok((peer, length, packet[..result as usize].to_vec()))
-    }
-}
-
-fn same_peer(a: &libc::sockaddr_storage, b: &libc::sockaddr_storage) -> bool {
-    unsafe {
-        libc::memcmp(
-            a as *const _ as *const _,
-            b as *const _ as *const _,
-            mem::size_of::<libc::sockaddr_storage>(),
-        ) == 0
+        datagram.peer_size = length;
+        datagram.length = result as usize;
+        Ok(())
     }
 }
 
@@ -188,7 +450,76 @@ fn peer_ipv4(peer: &libc::sockaddr_storage) -> Option<Ipv4Addr> {
     Some(Ipv4Addr::from(peer.sin_addr.s_addr.to_ne_bytes()))
 }
 
+fn peer_key(peer: &libc::sockaddr_storage) -> Option<PeerKey> {
+    if peer.ss_family as libc::c_int != libc::AF_INET {
+        return None;
+    }
+    let peer = unsafe { &*(peer as *const _ as *const libc::sockaddr_in) };
+    Some((
+        Ipv4Addr::from(peer.sin_addr.s_addr.to_ne_bytes()),
+        u16::from_be(peer.sin_port),
+    ))
+}
+
+fn rebuild_session_indexes(
+    sessions: &[Session],
+    peer_sessions: &mut HashMap<PeerKey, usize>,
+    vpn_sessions: &mut HashMap<Ipv4Addr, usize>,
+) {
+    peer_sessions.clear();
+    vpn_sessions.clear();
+    for (index, session) in sessions.iter().enumerate() {
+        if let Some(key) = peer_key(&session.peer) {
+            peer_sessions.insert(key, index);
+        }
+        if session.established {
+            vpn_sessions.insert(session.address, index);
+        }
+    }
+}
+
+fn remove_session(
+    sessions: &mut Vec<Session>,
+    index: usize,
+    peer_sessions: &mut HashMap<PeerKey, usize>,
+    vpn_sessions: &mut HashMap<Ipv4Addr, usize>,
+) {
+    sessions.swap_remove(index);
+    rebuild_session_indexes(sessions, peer_sessions, vpn_sessions);
+}
+
+fn expire_queued_packets(session: &mut Session, now: Instant) {
+    while session
+        .outbound
+        .front()
+        .is_some_and(|packet| now.duration_since(packet.enqueued_at) >= OUTBOUND_QUEUE_TTL)
+    {
+        session.outbound.pop_front();
+        session.queue_expired_drops = session.queue_expired_drops.saturating_add(1);
+    }
+}
+
+fn enqueue_tunnel_packet(session: &mut Session, packet: &[u8], now: Instant) {
+    expire_queued_packets(session, now);
+    match session.outbound.push_copy(packet, now) {
+        Ok(true) => {
+            session.queue_overflow_drops = session.queue_overflow_drops.saturating_add(1);
+        }
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("[server] unable to queue tunnel packet: {error}");
+            session.queue_overflow_drops = session.queue_overflow_drops.saturating_add(1);
+        }
+    }
+}
+
 fn send_tunnel_packet(session: &mut Session, packet: &[u8]) -> bool {
+    let now = Instant::now();
+    expire_queued_packets(session, now);
+    if !session.outbound.is_empty() {
+        enqueue_tunnel_packet(session, packet, now);
+        return true;
+    }
     match panic_gate("server DTLS write", || session.dtls.write(packet)) {
         Ok(written) if written == packet.len() => {
             session.last_activity = Instant::now();
@@ -203,13 +534,47 @@ fn send_tunnel_packet(session: &mut Session, packet: &[u8]) -> bool {
             );
             true
         }
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => true,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            enqueue_tunnel_packet(session, packet, now);
+            true
+        }
         Err(error) => {
             eprintln!("[server] DTLS session failed: {error}; removing client");
             session.disconnect_reason = "dtls_write_error";
             false
         }
     }
+}
+
+fn flush_outbound_queue(session: &mut Session) -> bool {
+    expire_queued_packets(session, Instant::now());
+    for _ in 0..OUTBOUND_FLUSH_BATCH {
+        let Some(packet) = session.outbound.front() else {
+            break;
+        };
+        let length = packet.length;
+        match panic_gate("queued server DTLS write", || {
+            session.dtls.write(&packet.payload[..length])
+        }) {
+            Ok(written) if written == length => {
+                session.outbound.pop_front();
+                session.last_activity = Instant::now();
+                session.bytes_tx = session.bytes_tx.saturating_add(written as u64);
+                session.packets_tx = session.packets_tx.saturating_add(1);
+            }
+            Ok(written) => {
+                eprintln!("[server] partial queued DTLS write: {written}/{length}; packet dropped");
+                session.outbound.pop_front();
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) => {
+                eprintln!("[server] queued DTLS write failed: {error}; removing client");
+                session.disconnect_reason = "dtls_write_error";
+                return false;
+            }
+        }
+    }
+    true
 }
 
 pub(crate) fn run(path: &str) -> io::Result<()> {
@@ -259,6 +624,9 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
     let allow_multicast = boolean_value(&server, "allow_multicast", false)?;
     let max_session_lifetime = duration_value(&server, "max_session_lifetime", 3600, 60, 604_800)?;
     let config_reload_interval = duration_value(&server, "config_reload_interval", 30, 5, 3600)?;
+    let control_socket_path = value(&server, "control_socket", "/var/run/autobricks-vpn.sock");
+    let mut control = ControlSocket::bind(control_socket_path.clone())?;
+    eprintln!("[server] control socket listening at {control_socket_path}");
     let socket = std::net::UdpSocket::bind(SocketAddr::from((listen, port)))?;
     eprintln!("[server] UDP bound to {listen}:{port}");
     socket.set_nonblocking(true)?;
@@ -277,6 +645,10 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
         ));
     }
     let mut bindings = validate_client_bindings(clients, vpn_address, &vpn_network)?;
+    let mut fingerprint_bindings: HashMap<String, Ipv4Addr> = bindings
+        .iter()
+        .map(|(address, fingerprint)| (fingerprint.clone(), *address))
+        .collect();
     let tun = Tun::open(&value(&server, "tun_name", "autobricks0"))?;
     eprintln!("[server] TUN opened: {}", tun.name());
     tun.configure_mtu(mtu)?;
@@ -299,15 +671,40 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
     let cookie_secret = generate_cookie_secret()?;
     let mut stateless_acceptor = create_stateless_acceptor(fd, &config, &cookie_secret)?;
     let mut sessions: Vec<Session> = Vec::with_capacity(max_clients);
+    let mut peer_sessions: HashMap<PeerKey, usize> = HashMap::with_capacity(max_clients);
+    let mut vpn_sessions: HashMap<Ipv4Addr, usize> = HashMap::with_capacity(max_clients);
     let mut handshake_limiter =
         IpRateLimiter::new(30, Duration::from_secs(60), Duration::from_secs(600));
     let mut next_config_reload = Instant::now() + config_reload_interval;
     let mut packet = [0u8; 2048];
+    let mut udp_inbound: VecDeque<Box<IncomingDatagram>> =
+        VecDeque::with_capacity(INPUT_QUEUE_CAPACITY);
+    let mut udp_free: VecDeque<Box<IncomingDatagram>> = (0..INPUT_QUEUE_CAPACITY)
+        .map(|_| Box::new(IncomingDatagram::new()))
+        .collect();
+    let mut tun_inbound = PacketQueue::new(INPUT_QUEUE_CAPACITY);
     println!(
         "Rust multi-client VPN hub listening on {listen}:{port} through {}",
         tun.name()
     );
     while RUNNING.load(Ordering::Relaxed) {
+        control.process(&mut sessions)?;
+        rebuild_session_indexes(&sessions, &mut peer_sessions, &mut vpn_sessions);
+        let mut queue_index = 0;
+        while queue_index < sessions.len() {
+            if sessions[queue_index].established
+                && !flush_outbound_queue(&mut sessions[queue_index])
+            {
+                remove_session(
+                    &mut sessions,
+                    queue_index,
+                    &mut peer_sessions,
+                    &mut vpn_sessions,
+                );
+            } else {
+                queue_index += 1;
+            }
+        }
         let now = Instant::now();
         handshake_limiter.purge(now);
         if now >= next_config_reload {
@@ -321,6 +718,10 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
                 Ok((new_bindings, new_acceptor)) => {
                     let bindings_changed = bindings != new_bindings;
                     bindings = new_bindings;
+                    fingerprint_bindings = bindings
+                        .iter()
+                        .map(|(address, fingerprint)| (fingerprint.clone(), *address))
+                        .collect();
                     stateless_acceptor = new_acceptor;
                     sessions.retain_mut(|session| {
                         if !session.established {
@@ -339,6 +740,7 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
                         }
                         still_authorized
                     });
+                    rebuild_session_indexes(&sessions, &mut peer_sessions, &mut vpn_sessions);
                     if bindings_changed {
                         eprintln!("[server] client fingerprint bindings reloaded");
                     }
@@ -358,7 +760,7 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
             .min()
             .unwrap_or(Duration::from_secs(1))
             .min(Duration::from_secs(1));
-        let ready = crate::platform::wait_io(&socket, &tun, poll_timeout)?;
+        let ready = crate::platform::wait_io(&socket, &tun, poll_timeout, false)?;
         let now = Instant::now();
         let mut session_index = 0;
         while session_index < sessions.len() {
@@ -371,7 +773,12 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
                 }) {
                     eprintln!("[server] DTLS retransmission failed: {error}");
                     sessions[session_index].disconnect_reason = "handshake_timeout_error";
-                    sessions.swap_remove(session_index);
+                    remove_session(
+                        &mut sessions,
+                        session_index,
+                        &mut peer_sessions,
+                        &mut vpn_sessions,
+                    );
                     continue;
                 }
                 let timeout = sessions[session_index].dtls.current_timeout();
@@ -403,11 +810,10 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
             }
             idle_valid && lifetime_valid
         });
+        rebuild_session_indexes(&sessions, &mut peer_sessions, &mut vpn_sessions);
         if ready.tun {
-            // Drain queued TUN packets so a burst on one client doesn't push others onto a
-            // separate poll() wakeup, which otherwise adds latency for interactive traffic.
             for _ in 0..DRAIN_BATCH_LIMIT {
-                let count = match tun.read_packet(&mut packet) {
+                let count = match tun.read_packet(tun_inbound.write_buffer()) {
                     Ok(count) => count,
                     Err(error) => match autobricks_vpn::classify_tun_error(&error) {
                         TunErrorAction::Retry | TunErrorAction::DropPacket => break,
@@ -417,53 +823,83 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
                 if count == 0 {
                     break;
                 }
-                if let Some(destination) = ipv4_destination(&packet[..count]) {
-                    let broadcast = ipv4_is_broadcast(destination, network_address, network_prefix);
-                    let multicast = destination.is_multicast();
-                    if (broadcast && allow_broadcast) || (multicast && allow_multicast) {
-                        let mut index = 0;
-                        while index < sessions.len() {
-                            if sessions[index].established
-                                && !send_tunnel_packet(&mut sessions[index], &packet[..count])
-                            {
-                                sessions.swap_remove(index);
-                            } else {
-                                index += 1;
-                            }
-                        }
-                    } else if !broadcast && !multicast {
-                        if let Some((index, _)) = sessions
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, session)| {
-                                session.established && session.address == destination
-                            })
-                            .max_by_key(|(_, session)| session.last_activity)
+                tun_inbound.commit_write(count)?;
+            }
+        }
+        // TUN consumer stage: route a bounded number of queued packets per loop.
+        for _ in 0..INPUT_PROCESS_BATCH {
+            let Some(packet) = tun_inbound.front() else {
+                break;
+            };
+            if let Some(destination) = ipv4_destination(packet) {
+                let broadcast = ipv4_is_broadcast(destination, network_address, network_prefix);
+                let multicast = destination.is_multicast();
+                if (broadcast && allow_broadcast) || (multicast && allow_multicast) {
+                    let mut index = 0;
+                    while index < sessions.len() {
+                        if sessions[index].established
+                            && !send_tunnel_packet(&mut sessions[index], packet)
                         {
-                            if !send_tunnel_packet(&mut sessions[index], &packet[..count]) {
-                                sessions.swap_remove(index);
-                            }
+                            remove_session(
+                                &mut sessions,
+                                index,
+                                &mut peer_sessions,
+                                &mut vpn_sessions,
+                            );
+                        } else {
+                            index += 1;
+                        }
+                    }
+                } else if !broadcast && !multicast {
+                    if let Some(index) = vpn_sessions.get(&destination).copied() {
+                        if !send_tunnel_packet(&mut sessions[index], packet) {
+                            remove_session(
+                                &mut sessions,
+                                index,
+                                &mut peer_sessions,
+                                &mut vpn_sessions,
+                            );
                         }
                     }
                 }
             }
+            tun_inbound.pop_front();
         }
         if ready.udp {
-            let (peer, peer_size, incoming) = match receive_peer(fd) {
-                Ok(packet) => packet,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    continue;
+            for _ in 0..UDP_DRAIN_BATCH_LIMIT {
+                let mut datagram = udp_free
+                    .pop_front()
+                    .or_else(|| udp_inbound.pop_front())
+                    .expect("UDP packet pool is non-empty");
+                match receive_peer(fd, &mut datagram) {
+                    Ok(()) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        udp_free.push_back(datagram);
+                        break;
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
+                udp_inbound.push_back(datagram);
+            }
+        }
+        // UDP consumer stage: wolfSSL remains owned by this single processing context.
+        for _ in 0..INPUT_PROCESS_BATCH {
+            let Some(datagram) = udp_inbound.pop_front() else {
+                break;
             };
-            let index = sessions
-                .iter()
-                .position(|session| same_peer(&session.peer, &peer));
+            let datagram = DatagramLease::new(datagram, &mut udp_free);
+            let peer = datagram.peer;
+            let peer_size = datagram.peer_size;
+            let incoming = &datagram.payload[..datagram.length];
+            let Some(incoming_peer_key) = peer_key(&peer) else {
+                continue;
+            };
+            let index = peer_sessions.get(&incoming_peer_key).copied();
             let new_session = index.is_none();
             let index = match index {
                 Some(index) => index,
@@ -475,7 +911,7 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
                         continue;
                     }
                     if let Err(error) =
-                        stateless_acceptor.set_incoming_peer(peer, peer_size, incoming.clone())
+                        stateless_acceptor.set_incoming_peer(peer, peer_size, incoming)
                     {
                         eprintln!("[server] unable to prepare stateless DTLS accept: {error}");
                         stateless_acceptor =
@@ -505,6 +941,11 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
                             sessions.retain(|session| {
                                 session.established || peer_ipv4(&session.peer) != Some(peer_ip)
                             });
+                            rebuild_session_indexes(
+                                &sessions,
+                                &mut peer_sessions,
+                                &mut vpn_sessions,
+                            );
                             continue;
                         }
                         RateLimitDecision::Banned => continue,
@@ -538,7 +979,12 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
                             .filter(|(_, session)| !session.established)
                             .min_by_key(|(_, session)| session.last_activity)
                         {
-                            sessions.swap_remove(oldest);
+                            remove_session(
+                                &mut sessions,
+                                oldest,
+                                &mut peer_sessions,
+                                &mut vpn_sessions,
+                            );
                         }
                     }
                     eprintln!("[server] DTLS cookie verified; creating session");
@@ -557,9 +1003,13 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
                         bytes_rx: 0,
                         packets_tx: 0,
                         packets_rx: 0,
+                        outbound: OutboundQueue::new(OUTBOUND_QUEUE_CAPACITY),
+                        queue_expired_drops: 0,
+                        queue_overflow_drops: 0,
                         disconnect_reason: "server_shutdown",
                     };
                     sessions.push(session);
+                    rebuild_session_indexes(&sessions, &mut peer_sessions, &mut vpn_sessions);
                     sessions.len() - 1
                 }
             };
@@ -571,21 +1021,22 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
             if !new_session {
                 if let Err(error) = session.dtls.push_incoming(incoming) {
                     eprintln!("[server] unable to queue client datagram: {error}");
-                    sessions.swap_remove(index);
+                    remove_session(&mut sessions, index, &mut peer_sessions, &mut vpn_sessions);
                     continue;
                 }
             }
             if !session.established {
                 eprintln!("[server] processing DTLS handshake for peer session");
-                let handshake_complete =
-                    match panic_gate("client DTLS handshake", || session.dtls.handshake()) {
-                        Ok(complete) => complete,
-                        Err(error) => {
-                            eprintln!("[server] DTLS handshake rejected: {error}");
-                            sessions.swap_remove(index);
-                            continue;
-                        }
-                    };
+                let handshake_complete = match panic_gate("client DTLS handshake", || {
+                    session.dtls.handshake()
+                }) {
+                    Ok(complete) => complete,
+                    Err(error) => {
+                        eprintln!("[server] DTLS handshake rejected: {error}");
+                        remove_session(&mut sessions, index, &mut peer_sessions, &mut vpn_sessions);
+                        continue;
+                    }
+                };
                 if handshake_complete {
                     eprintln!("[server] DTLS handshake complete; reading certificate");
                     let fingerprint =
@@ -593,26 +1044,33 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
                             Ok(fingerprint) => fingerprint,
                             Err(error) => {
                                 eprintln!("[server] unable to authenticate peer: {error}");
-                                sessions.swap_remove(index);
+                                remove_session(
+                                    &mut sessions,
+                                    index,
+                                    &mut peer_sessions,
+                                    &mut vpn_sessions,
+                                );
                                 continue;
                             }
                         };
-                    let Some((address, _)) = bindings
-                        .iter()
-                        .find(|(_, expected)| **expected == fingerprint)
-                    else {
+                    let Some(address) = fingerprint_bindings.get(&fingerprint).copied() else {
                         eprintln!("unassigned client certificate {fingerprint}");
-                        sessions.swap_remove(index);
+                        remove_session(&mut sessions, index, &mut peer_sessions, &mut vpn_sessions);
                         continue;
                     };
                     if verify_client_san_ip {
                         let san_matches = match panic_gate("client SAN IP verification", || {
-                            session.dtls.peer_certificate_has_san_ip(*address)
+                            session.dtls.peer_certificate_has_san_ip(address)
                         }) {
                             Ok(matches) => matches,
                             Err(error) => {
                                 eprintln!("[server] unable to verify client SAN IP: {error}");
-                                sessions.swap_remove(index);
+                                remove_session(
+                                    &mut sessions,
+                                    index,
+                                    &mut peer_sessions,
+                                    &mut vpn_sessions,
+                                );
                                 continue;
                             }
                         };
@@ -620,46 +1078,47 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
                             eprintln!(
                                 "[server] client certificate SAN IP does not match assigned VPN IP {address}"
                             );
-                            sessions.swap_remove(index);
+                            remove_session(
+                                &mut sessions,
+                                index,
+                                &mut peer_sessions,
+                                &mut vpn_sessions,
+                            );
                             continue;
                         }
                     }
-                    session.address = *address;
+                    session.address = address;
                     session.fingerprint = Some(fingerprint.clone());
                     session.established = true;
                     session.established_at = Some(Instant::now());
                     session.dtls_deadline = None;
-                    let connected_peer = session.peer;
                     let connected_address = session.address;
-                    let replaces_existing = sessions.iter().any(|candidate| {
-                        candidate.established
-                            && candidate.address == connected_address
-                            && !same_peer(&candidate.peer, &connected_peer)
-                    });
+                    let existing_index = vpn_sessions
+                        .get(&connected_address)
+                        .copied()
+                        .filter(|existing| *existing != index);
+                    let replaces_existing = existing_index.is_some();
                     if established_before_processing >= max_clients && !replaces_existing {
                         eprintln!("maximum client count ({max_clients}) reached after handshake");
                         sessions[index].disconnect_reason = "max_clients";
-                        sessions.swap_remove(index);
+                        remove_session(&mut sessions, index, &mut peer_sessions, &mut vpn_sessions);
                         continue;
                     }
                     println!("[server] client {fingerprint} connected as {connected_address}");
                     autobricks_vpn::syslog_connection_event(&format!(
                         "client connected vpn_ip={connected_address} fingerprint={fingerprint}"
                     ));
-                    let mut duplicate_index = 0;
-                    while duplicate_index < sessions.len() {
-                        let duplicate = sessions[duplicate_index].established
-                            && sessions[duplicate_index].address == connected_address
-                            && !same_peer(&sessions[duplicate_index].peer, &connected_peer);
-                        if duplicate {
-                            eprintln!(
-                                "[server] replacing previous session for {connected_address}"
-                            );
-                            sessions[duplicate_index].disconnect_reason = "replaced";
-                            sessions.swap_remove(duplicate_index);
-                        } else {
-                            duplicate_index += 1;
-                        }
+                    if let Some(existing_index) = existing_index {
+                        eprintln!("[server] replacing previous session for {connected_address}");
+                        sessions[existing_index].disconnect_reason = "replaced";
+                        remove_session(
+                            &mut sessions,
+                            existing_index,
+                            &mut peer_sessions,
+                            &mut vpn_sessions,
+                        );
+                    } else {
+                        rebuild_session_indexes(&sessions, &mut peer_sessions, &mut vpn_sessions);
                     }
                 } else {
                     session.dtls_deadline = Some(Instant::now() + session.dtls.current_timeout());
@@ -672,7 +1131,7 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
                     Err(error) => {
                         eprintln!("[server] client DTLS session failed: {error}");
                         session.disconnect_reason = "dtls_read_error";
-                        sessions.swap_remove(index);
+                        remove_session(&mut sessions, index, &mut peer_sessions, &mut vpn_sessions);
                         continue;
                     }
                 };
@@ -685,7 +1144,12 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
                         if error.kind() != io::ErrorKind::WouldBlock {
                             eprintln!("[server] keepalive response failed: {error}");
                             session.disconnect_reason = "keepalive_write_error";
-                            sessions.swap_remove(index);
+                            remove_session(
+                                &mut sessions,
+                                index,
+                                &mut peer_sessions,
+                                &mut vpn_sessions,
+                            );
                         }
                     }
                     continue;
@@ -715,7 +1179,42 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
                 }
             }
         }
+        control.publish_if_changed(&sessions);
     }
     eprintln!("[server] shutting down; client forwarding rule removed");
     Ok(())
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+
+    #[test]
+    fn outbound_queue_reuses_fixed_slots_and_drops_oldest() {
+        let mut queue = OutboundQueue::new(2);
+        let now = Instant::now();
+        assert!(!queue.push_copy(b"first", now).unwrap());
+        assert!(!queue.push_copy(b"second", now).unwrap());
+        assert!(queue.push_copy(b"third", now).unwrap());
+        let front = queue.front().unwrap();
+        assert_eq!(&front.payload[..front.length], b"second");
+        queue.pop_front();
+        let front = queue.front().unwrap();
+        assert_eq!(&front.payload[..front.length], b"third");
+    }
+
+    #[test]
+    fn datagram_lease_returns_preallocated_slot() {
+        let mut free = VecDeque::with_capacity(1);
+        let slot = Box::new(IncomingDatagram::new());
+        let address = (&*slot) as *const IncomingDatagram;
+        {
+            let lease = DatagramLease::new(slot, &mut free);
+            assert_eq!((&*lease) as *const IncomingDatagram, address);
+        }
+        assert_eq!(
+            (&**free.front().unwrap()) as *const IncomingDatagram,
+            address
+        );
+    }
 }

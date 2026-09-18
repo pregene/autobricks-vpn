@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 pub(crate) struct IoReady {
     pub udp: bool,
+    pub udp_writable: bool,
     pub tun: bool,
 }
 
@@ -36,10 +37,16 @@ pub(crate) fn wait_udp(socket: &UdpSocket, timeout: Duration) -> io::Result<bool
     }
 }
 
-pub(crate) fn wait_io(_socket: &UdpSocket, _tun: &Tun, timeout: Duration) -> io::Result<IoReady> {
+pub(crate) fn wait_io(
+    _socket: &UdpSocket,
+    _tun: &Tun,
+    timeout: Duration,
+    want_udp_write: bool,
+) -> io::Result<IoReady> {
     std::thread::sleep(timeout.clamp(Duration::from_millis(1), Duration::from_millis(10)));
     Ok(IoReady {
         udp: true,
+        udp_writable: want_udp_write,
         tun: true,
     })
 }

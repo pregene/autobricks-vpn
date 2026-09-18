@@ -1,8 +1,9 @@
 use autobricks_vpn::{
     ipv4_packet_addresses, ipv4_socket_addr_size, is_keepalive_packet, panic_gate,
-    parse_ini_section, socket_addr_storage, Config, DnsGuard, Dtls, DtlsIo, Tun, KEEPALIVE_PACKET,
+    parse_ini_section, socket_addr_storage, Config, DnsGuard, Dtls, DtlsIo, PacketQueue, Tun,
+    KEEPALIVE_PACKET,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,6 +12,81 @@ use std::time::{Duration, Instant};
 static RUNNING: AtomicBool = AtomicBool::new(true);
 /// Caps how many packets are drained per wakeup so one busy fd cannot starve the other.
 const DRAIN_BATCH_LIMIT: u32 = 64;
+const INPUT_PROCESS_BATCH: usize = 32;
+const INPUT_QUEUE_CAPACITY: usize = 512;
+const OUTBOUND_QUEUE_CAPACITY: usize = 256;
+const OUTBOUND_QUEUE_TTL: Duration = Duration::from_secs(2);
+const OUTBOUND_FLUSH_BATCH: usize = 32;
+
+struct QueuedPacket {
+    enqueued_at: Instant,
+    payload: Vec<u8>,
+}
+
+#[derive(Default)]
+struct QueueStats {
+    would_block: u64,
+    expired_drops: u64,
+    overflow_drops: u64,
+    max_depth: usize,
+}
+
+fn expire_queued_packets(queue: &mut VecDeque<QueuedPacket>, stats: &mut QueueStats, now: Instant) {
+    while queue
+        .front()
+        .is_some_and(|packet| now.duration_since(packet.enqueued_at) >= OUTBOUND_QUEUE_TTL)
+    {
+        queue.pop_front();
+        stats.expired_drops = stats.expired_drops.saturating_add(1);
+    }
+}
+
+fn enqueue_packet(
+    queue: &mut VecDeque<QueuedPacket>,
+    stats: &mut QueueStats,
+    packet: &[u8],
+    now: Instant,
+) {
+    expire_queued_packets(queue, stats, now);
+    if queue.len() >= OUTBOUND_QUEUE_CAPACITY {
+        queue.pop_front();
+        stats.overflow_drops = stats.overflow_drops.saturating_add(1);
+    }
+    queue.push_back(QueuedPacket {
+        enqueued_at: now,
+        payload: packet.to_vec(),
+    });
+    stats.max_depth = stats.max_depth.max(queue.len());
+}
+
+fn flush_outbound_queue(
+    dtls: &mut Dtls,
+    queue: &mut VecDeque<QueuedPacket>,
+    stats: &mut QueueStats,
+) -> io::Result<()> {
+    expire_queued_packets(queue, stats, Instant::now());
+    for _ in 0..OUTBOUND_FLUSH_BATCH {
+        let Some(packet) = queue.front() else {
+            break;
+        };
+        let length = packet.payload.len();
+        match dtls.write(&packet.payload) {
+            Ok(written) if written == length => {
+                queue.pop_front();
+            }
+            Ok(written) => {
+                queue.pop_front();
+                eprintln!("[client] partial queued DTLS write: {written}/{length}; packet dropped");
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                stats.would_block = stats.would_block.saturating_add(1);
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
 
 #[cfg(unix)]
 extern "C" fn stop(_signal: libc::c_int) {
@@ -152,6 +228,17 @@ fn run_connection(
     verify_server_san_ip: bool,
 ) -> io::Result<()> {
     let (socket, mut dtls) = connect(server, port, config, verify_server_san_ip)?;
+    #[cfg(unix)]
+    {
+        // After the handshake, only this loop receives UDP datagrams. wolfSSL consumes
+        // them from a bounded queue instead of reading the socket inside its callback.
+        let server_peer = socket_addr_storage(SocketAddr::from((server, port)));
+        dtls.set_io(DtlsIo::new_queued_client(
+            crate::platform::socket_handle(&socket),
+            server_peer,
+            ipv4_socket_addr_size() as _,
+        ))?;
+    }
     #[cfg(windows)]
     let _socket_lifetime_guard = &socket;
     println!(
@@ -162,11 +249,29 @@ fn run_connection(
     let mut packet = [0u8; 2048];
     let mut last_keepalive = Instant::now();
     let mut last_server_activity = Instant::now();
+    let mut outbound = VecDeque::with_capacity(OUTBOUND_QUEUE_CAPACITY);
+    let mut tun_inbound = PacketQueue::new(INPUT_QUEUE_CAPACITY);
+    #[cfg(unix)]
+    let mut udp_inbound = PacketQueue::new(INPUT_QUEUE_CAPACITY);
+    let mut queue_stats = QueueStats::default();
 
     while RUNNING.load(Ordering::Relaxed) {
+        flush_outbound_queue(&mut dtls, &mut outbound, &mut queue_stats)?;
         let until_keepalive = keepalive_interval.saturating_sub(last_keepalive.elapsed());
         let until_dead = liveness_timeout.saturating_sub(last_server_activity.elapsed());
-        let ready = crate::platform::wait_io(&socket, tun, until_keepalive.min(until_dead))?;
+        let until_queue_expiration = outbound
+            .front()
+            .map(|packet| OUTBOUND_QUEUE_TTL.saturating_sub(packet.enqueued_at.elapsed()))
+            .unwrap_or(Duration::MAX);
+        let ready = crate::platform::wait_io(
+            &socket,
+            tun,
+            until_keepalive.min(until_dead).min(until_queue_expiration),
+            !outbound.is_empty(),
+        )?;
+        if ready.udp_writable {
+            flush_outbound_queue(&mut dtls, &mut outbound, &mut queue_stats)?;
+        }
         if last_server_activity.elapsed() >= liveness_timeout {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -188,10 +293,9 @@ fn run_connection(
             }
         }
         if ready.tun {
-            // Drain everything queued on the TUN device so a burst of local traffic doesn't
-            // each need a separate poll() wakeup, which otherwise delays interactive packets.
+            // Event stage: empty the kernel TUN queue quickly without doing DTLS work here.
             for _ in 0..DRAIN_BATCH_LIMIT {
-                let count = match tun.read_packet(&mut packet) {
+                let count = match tun.read_packet(tun_inbound.write_buffer()) {
                     Ok(count) => count,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                     Err(error) => return Err(error),
@@ -199,19 +303,44 @@ fn run_connection(
                 if count == 0 {
                     break;
                 }
-                match dtls.write(&packet[..count]) {
-                    Ok(written) if written == count => {}
-                    Ok(written) => eprintln!(
-                        "[client] partial DTLS write: {written}/{count} bytes; packet dropped"
-                    ),
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        eprintln!("[client] DTLS output busy; packet dropped")
-                    }
-                    Err(error) => return Err(error),
-                }
+                tun_inbound.commit_write(count)?;
             }
         }
+        // Processing stage: bounded work keeps UDP receive, keepalive and queue flush fair.
+        for _ in 0..INPUT_PROCESS_BATCH {
+            let Some(packet) = tun_inbound.front() else {
+                break;
+            };
+            if !outbound.is_empty() {
+                enqueue_packet(&mut outbound, &mut queue_stats, packet, Instant::now());
+                tun_inbound.pop_front();
+                continue;
+            }
+            match dtls.write(packet) {
+                Ok(written) if written == packet.len() => {}
+                Ok(written) => eprintln!(
+                    "[client] partial DTLS write: {written}/{} bytes; packet dropped",
+                    packet.len()
+                ),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    queue_stats.would_block = queue_stats.would_block.saturating_add(1);
+                    enqueue_packet(&mut outbound, &mut queue_stats, packet, Instant::now());
+                }
+                Err(error) => return Err(error),
+            }
+            tun_inbound.pop_front();
+        }
         if ready.udp {
+            #[cfg(unix)]
+            for _ in 0..DRAIN_BATCH_LIMIT {
+                let count = match socket.recv(udp_inbound.write_buffer()) {
+                    Ok(count) => count,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(error),
+                };
+                udp_inbound.commit_write(count)?;
+            }
+            #[cfg(windows)]
             for _ in 0..DRAIN_BATCH_LIMIT {
                 let count = match dtls.read(&mut packet) {
                     Ok(count) => count,
@@ -229,7 +358,36 @@ fn run_connection(
                 }
             }
         }
+        #[cfg(unix)]
+        for _ in 0..INPUT_PROCESS_BATCH {
+            let Some(datagram) = udp_inbound.front() else {
+                break;
+            };
+            dtls.push_incoming(datagram)?;
+            udp_inbound.pop_front();
+            let count = match dtls.read(&mut packet) {
+                Ok(count) => count,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) => return Err(error),
+            };
+            last_server_activity = Instant::now();
+            if is_keepalive_packet(&packet[..count]) {
+                continue;
+            }
+            if ipv4_packet_addresses(&packet[..count]).is_some() {
+                tun.write_packet(&packet[..count])?;
+            } else {
+                eprintln!("[client] malformed IPv4 packet from server dropped");
+            }
+        }
     }
+    eprintln!(
+        "[client] outbound queue stats: would_block={} expired_drops={} overflow_drops={} max_depth={}",
+        queue_stats.would_block,
+        queue_stats.expired_drops,
+        queue_stats.overflow_drops,
+        queue_stats.max_depth
+    );
     Ok(())
 }
 

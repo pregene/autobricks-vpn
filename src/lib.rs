@@ -135,6 +135,93 @@ const SOCKET_ERROR: c_int = -308;
 pub const KEEPALIVE_PACKET: &[u8] = &[0];
 pub const MIN_TUN_MTU: u16 = 576;
 pub const MAX_TUN_MTU: u16 = 1500;
+pub const PACKET_BUFFER_SIZE: usize = 2048;
+
+struct PacketSlot {
+    bytes: [u8; PACKET_BUFFER_SIZE],
+    length: usize,
+}
+
+/// Fixed-capacity packet ring. Its backing storage is allocated once and reused; packet-path
+/// pushes never allocate. `write_buffer` lets a socket or TUN read directly into the final slot.
+pub struct PacketQueue {
+    slots: Box<[PacketSlot]>,
+    head: usize,
+    length: usize,
+}
+
+impl PacketQueue {
+    pub fn new(capacity: usize) -> Self {
+        let slots = (0..capacity.max(1))
+            .map(|_| PacketSlot {
+                bytes: [0; PACKET_BUFFER_SIZE],
+                length: 0,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            slots,
+            head: 0,
+            length: 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+    pub fn len(&self) -> usize {
+        self.length
+    }
+
+    pub fn write_buffer(&mut self) -> &mut [u8] {
+        if self.length == self.slots.len() {
+            self.pop_front();
+        }
+        let index = (self.head + self.length) % self.slots.len();
+        &mut self.slots[index].bytes
+    }
+
+    pub fn commit_write(&mut self, length: usize) -> io::Result<()> {
+        if length > PACKET_BUFFER_SIZE || self.length == self.slots.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid packet ring write",
+            ));
+        }
+        let index = (self.head + self.length) % self.slots.len();
+        self.slots[index].length = length;
+        self.length += 1;
+        Ok(())
+    }
+
+    pub fn push_copy(&mut self, packet: &[u8]) -> io::Result<()> {
+        if packet.len() > PACKET_BUFFER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "packet exceeds fixed slot",
+            ));
+        }
+        self.write_buffer()[..packet.len()].copy_from_slice(packet);
+        self.commit_write(packet.len())
+    }
+
+    pub fn front(&self) -> Option<&[u8]> {
+        if self.length == 0 {
+            return None;
+        }
+        let slot = &self.slots[self.head];
+        Some(&slot.bytes[..slot.length])
+    }
+
+    pub fn pop_front(&mut self) {
+        if self.length == 0 {
+            return;
+        }
+        self.slots[self.head].length = 0;
+        self.head = (self.head + 1) % self.slots.len();
+        self.length -= 1;
+    }
+}
 
 pub fn is_keepalive_packet(packet: &[u8]) -> bool {
     packet == KEEPALIVE_PACKET
@@ -626,7 +713,7 @@ impl Dtls {
         Ok(())
     }
 
-    pub fn push_incoming(&mut self, packet: Vec<u8>) -> io::Result<()> {
+    pub fn push_incoming(&mut self, packet: &[u8]) -> io::Result<()> {
         let io = self
             .io
             .as_mut()
@@ -636,15 +723,14 @@ impl Dtls {
                 "cannot queue packets for a connected DTLS socket",
             ));
         }
-        io.incoming.push_back(packet);
-        Ok(())
+        io.incoming.push_copy(packet)
     }
 
     pub fn set_incoming_peer(
         &mut self,
         peer: SocketAddrStorage,
         peer_size: SocketLength,
-        packet: Vec<u8>,
+        packet: &[u8],
     ) -> io::Result<()> {
         self.set_peer(&peer, peer_size as usize)?;
         let io = self
@@ -658,9 +744,10 @@ impl Dtls {
         }
         io.peer = peer;
         io.peer_size = peer_size;
-        io.incoming.clear();
-        io.incoming.push_back(packet);
-        Ok(())
+        while !io.incoming.is_empty() {
+            io.incoming.pop_front();
+        }
+        io.incoming.push_copy(packet)
     }
 
     pub fn accept_stateless(&mut self) -> io::Result<bool> {
@@ -890,7 +977,8 @@ pub struct DtlsIo {
     peer: SocketAddrStorage,
     peer_size: SocketLength,
     direct_receive: bool,
-    incoming: VecDeque<Vec<u8>>,
+    connected_send: bool,
+    incoming: PacketQueue,
 }
 
 impl DtlsIo {
@@ -900,7 +988,8 @@ impl DtlsIo {
             peer,
             peer_size,
             direct_receive: false,
-            incoming: VecDeque::new(),
+            connected_send: false,
+            incoming: PacketQueue::new(256),
         }
     }
 
@@ -910,12 +999,24 @@ impl DtlsIo {
             peer,
             peer_size,
             direct_receive: true,
-            incoming: VecDeque::new(),
+            connected_send: true,
+            incoming: PacketQueue::new(256),
         }
     }
 
-    pub fn push(&mut self, packet: Vec<u8>) {
-        self.incoming.push_back(packet);
+    pub fn new_queued_client(fd: RawFd, peer: SocketAddrStorage, peer_size: SocketLength) -> Self {
+        Self {
+            fd,
+            peer,
+            peer_size,
+            direct_receive: false,
+            connected_send: true,
+            incoming: PacketQueue::new(256),
+        }
+    }
+
+    pub fn push(&mut self, packet: &[u8]) -> io::Result<()> {
+        self.incoming.push_copy(packet)
     }
 }
 
@@ -940,14 +1041,16 @@ unsafe extern "C" fn dtls_recv(
         let result = recv(io.fd, buffer, size, 0) as isize;
         return if result < 0 { -2 } else { result as c_int };
     }
-    let Some(packet) = io.incoming.pop_front() else {
+    let Some(packet) = io.incoming.front() else {
         return -2;
     };
     if packet.len() > size as usize {
         return -1;
     }
     ptr::copy_nonoverlapping(packet.as_ptr(), buffer as *mut u8, packet.len());
-    packet.len() as c_int
+    let length = packet.len() as c_int;
+    io.incoming.pop_front();
+    length
 }
 
 unsafe extern "C" fn dtls_send(
@@ -957,7 +1060,7 @@ unsafe extern "C" fn dtls_send(
     context: *mut c_void,
 ) -> c_int {
     let io = &*(context as *const DtlsIo);
-    let result = if io.direct_receive {
+    let result = if io.connected_send {
         #[cfg(unix)]
         {
             libc::send(io.fd, buffer as *const c_void, size as usize, 0)
@@ -1002,6 +1105,13 @@ impl ForwardingGuard {
         #[cfg(target_os = "linux")]
         {
             run_command("sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
+            // VPN clients share one TUN interface but cannot reach each other directly.
+            // Linux otherwise emits misleading ICMP Redirect Host messages when it
+            // forwards a packet back out through that same interface.
+            run_command(
+                "sysctl",
+                &["-w", &format!("net.ipv4.conf.{interface}.send_redirects=0")],
+            )?;
             let mut guard = Self {
                 interface: interface.to_owned(),
                 network: network.to_owned(),
@@ -1472,7 +1582,7 @@ mod tests {
     use super::{
         ipv4_in_cidr, ipv4_is_broadcast, ipv4_packet_addresses, normalize_sha256_fingerprint,
         panic_gate, parse_ipv4_cidr, validate_client_bindings, validate_datagram_write,
-        validate_private_key_file, IpRateLimiter, RateLimitDecision,
+        validate_private_key_file, IpRateLimiter, PacketQueue, RateLimitDecision,
     };
     use std::io;
     use std::net::Ipv4Addr;
@@ -1509,6 +1619,18 @@ mod tests {
         let error = validate_datagram_write(0, 1).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::WriteZero);
         assert_eq!(error.to_string(), "partial datagram write: 0/1 bytes");
+    }
+
+    #[test]
+    fn fixed_packet_queue_reuses_slots_and_drops_oldest_when_full() {
+        let mut queue = PacketQueue::new(2);
+        queue.push_copy(b"one").unwrap();
+        queue.push_copy(b"two").unwrap();
+        queue.push_copy(b"three").unwrap();
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.front(), Some(&b"two"[..]));
+        queue.pop_front();
+        assert_eq!(queue.front(), Some(&b"three"[..]));
     }
 
     #[test]

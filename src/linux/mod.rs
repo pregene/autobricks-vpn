@@ -10,8 +10,10 @@ use std::net::UdpSocket;
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::Duration;
 
+#[allow(dead_code)]
 pub(crate) struct IoReady {
     pub udp: bool,
+    pub udp_writable: bool,
     pub tun: bool,
 }
 
@@ -31,11 +33,17 @@ pub(crate) fn wait_udp(socket: &UdpSocket, timeout: Duration) -> io::Result<bool
     Ok(descriptor.revents & libc::POLLIN != 0)
 }
 
-pub(crate) fn wait_io(socket: &UdpSocket, tun: &Tun, timeout: Duration) -> io::Result<IoReady> {
+#[allow(dead_code)]
+pub(crate) fn wait_io(
+    socket: &UdpSocket,
+    tun: &Tun,
+    timeout: Duration,
+    want_udp_write: bool,
+) -> io::Result<IoReady> {
     let mut descriptors = [
         libc::pollfd {
             fd: socket_handle(socket),
-            events: libc::POLLIN,
+            events: libc::POLLIN | if want_udp_write { libc::POLLOUT } else { 0 },
             revents: 0,
         },
         libc::pollfd {
@@ -59,6 +67,7 @@ pub(crate) fn wait_io(socket: &UdpSocket, tun: &Tun, timeout: Duration) -> io::R
     }
     Ok(IoReady {
         udp: descriptors[0].revents & libc::POLLIN != 0,
+        udp_writable: descriptors[0].revents & libc::POLLOUT != 0,
         tun: descriptors[1].revents & libc::POLLIN != 0,
     })
 }

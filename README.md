@@ -46,6 +46,112 @@ Copyright © 2026 Autobricks.co.kr. All rights reserved.
 
 지원하지 않는 항목 중 IPv6, NAT 및 외부 인터넷 연결은 현재 설계 목적상 구현 대상이 아닙니다.
 
+## 서버·클라이언트 패킷 처리 구성
+
+### 현재 구현: 단일 packet worker와 단계별 bounded queue
+
+서버와 클라이언트는 각각 하나의 packet worker thread에서 readiness 감시, bounded queue 생산·소비와 wolfSSL DTLS 처리를 수행합니다. 4-thread 실험은 channel 전환 및 packet 할당 비용으로 TCP 정방향 성능이 저하되어 2026-09-18에 원복했습니다.
+
+```mermaid
+flowchart LR
+    subgraph Client[macOS client - 1 packet thread]
+        CT["event + DTLS worker"]
+        CUT["utun input queue<br/>512 packets"]
+        CUR["encrypted UDP input queue<br/>512 datagrams"]
+        CUQ["DTLS to UDP output queue<br/>256 packets / TTL 2s"]
+        UTUN[(utun)]
+        CUDP[(connected UDP socket)]
+        UTUN -->|read batch| CUT --> CT
+        CUDP -->|recv batch| CUR --> CT
+        CT -->|encrypt| CUQ --> CUDP
+        CT -->|decrypt + validate| UTUN
+    end
+
+    subgraph Server[Linux server - 1 packet thread]
+        ST["event + session/DTLS worker"]
+        SUT["TUN input queue<br/>1024 packets"]
+        SUR["encrypted UDP input queue<br/>1024 datagrams"]
+        SSQ["per-session output queue<br/>256 packets / TTL 2s"]
+        STUN[(autobricks0)]
+        SUDP[(UDP socket)]
+        STUN -->|read batch| SUT --> ST
+        SUDP -->|recv batch| SUR --> ST
+        ST -->|encrypt| SSQ --> SUDP
+        ST -->|decrypt + validate| STUN
+    end
+    CUDP <-->|DTLS 1.3| SUDP
+```
+
+현재 packet-path thread 수는 프로세스당 1개입니다. wolfSSL session은 이 thread만 접근하므로 같은 DTLS session에 대한 동시 FFI 호출은 발생하지 않습니다.
+
+UDP/TUN 입력 queue와 wolfSSL callback 입력 queue는 2,048바이트 고정 slot을 시작 시 한 번 확보해 재사용합니다. 서버 UDP 수신도 1,024개 datagram slot과 peer metadata를 시작 시 pool로 확보하고 `recvfrom()`이 최종 slot에 직접 기록합니다. 세션별 DTLS `WouldBlock` 송신 queue 역시 256개 고정 slot을 세션 생성 시 확보하므로 정상 packet 경로에서 `Vec`, `to_vec()` 또는 packet별 heap allocation을 만들지 않습니다. 관리 소켓의 상태 비교 문자열도 scratch buffer를 재사용합니다. wolfSSL 내부 처리와 TUN/DTLS 경계에서 라이브러리가 요구하는 복사는 남아 있습니다.
+
+### 현재 패킷 흐름
+
+클라이언트에서 서버로 보내는 흐름은 다음과 같습니다.
+
+```text
+Application
+  -> macOS IP stack
+  -> utun
+  -> client TUN input queue
+  -> client wolfSSL DTLS encrypt
+  -> client UDP output queue
+  -> Internet UDP
+  -> server UDP input queue
+  -> endpoint HashMap lookup O(1)
+  -> server wolfSSL DTLS decrypt
+  -> source VPN IP validation
+  -> server TUN write
+  -> server IP stack / destination service
+```
+
+서버에서 클라이언트로 보내는 흐름은 다음과 같습니다.
+
+```text
+Server service / remote VPN client
+  -> server IP stack
+  -> autobricks0 TUN
+  -> server TUN input queue
+  -> destination VPN IP HashMap lookup O(1)
+  -> session wolfSSL DTLS encrypt
+  -> per-session UDP output queue
+  -> Internet UDP
+  -> client UDP input queue
+  -> client wolfSSL DTLS decrypt
+  -> IPv4 packet validation
+  -> utun write
+  -> macOS IP stack
+  -> Application
+```
+
+Queue가 가득 차면 가장 오래된 packet을 제거해 메모리 사용량과 지연을 제한합니다. 암호화 송신 queue의 packet은 2초가 지나면 폐기합니다. TCP 신뢰성과 재전송은 tunnel 내부의 TCP endpoint가 담당하며 DTLS application data 자체는 손실 packet을 재전송하지 않습니다.
+
+### 검토한 4-thread 구조와 원복 결과
+
+```mermaid
+flowchart LR
+    RXU["Thread 1<br/>UDP RX"] --> ERX["encrypted RX queue"]
+    RXT["Thread 2<br/>TUN RX"] --> PTX["plaintext TX queue"]
+    ERX --> CRYPTO["Thread 3<br/>DTLS/session owner"]
+    PTX --> CRYPTO
+    CRYPTO --> PRX["plaintext TUN TX queue"]
+    CRYPTO -->|wolfSSL callback send| UDP[(UDP socket)]
+    PRX --> WRITER["Thread 4<br/>TUN writer"]
+    WRITER --> TUN[(TUN / utun)]
+```
+
+| Thread | 책임 | 하지 않는 일 |
+|---|---|---|
+| UDP RX | socket을 `WouldBlock`까지 빠르게 비우고 encrypted RX queue에 저장 | wolfSSL 호출, TUN write |
+| TUN RX | TUN/utun을 `WouldBlock`까지 비우고 plaintext TX queue에 저장 | session lookup 이후 처리, 암호화 |
+| DTLS/session owner | handshake, 암복호화, 인증, 서버 session HashMap routing | raw UDP/TUN blocking I/O |
+| TUN writer | 복호화된 plaintext queue를 TUN/utun에 기록 | 암복호화, 인증 상태 변경 |
+
+wolfSSL session은 DTLS/session owner thread 하나만 접근합니다. 서버에서 DTLS worker를 여러 개로 확장할 경우에도 session은 endpoint hash로 특정 worker에 고정하여 packet 순서와 wolfSSL 객체의 단일 소유권을 유지합니다. thread 사이 queue는 반드시 bounded로 두며 queue depth, 최대 depth, overflow, TTL expiration과 `WouldBlock` 횟수를 방향별로 계측합니다.
+
+2026-09-18 실험에서는 위 구조를 서버와 macOS client에 실제 적용했으나 클라이언트 유휴 CPU가 약 10%로 증가했고 TCP 4병렬 정방향이 46~99 Mbps로 하락했습니다. 같은 시점 WireGuard는 120~289 Mbps였습니다. `try_send` drop을 blocking backpressure로 바꾼 뒤에도 Autobricks 정방향은 99 Mbps에 머물렀으므로 thread/channel 구조를 유지하지 않고 단일 worker 구조로 원복했습니다. 향후 재시도 시에는 packet별 `Vec`/channel 복사를 피하는 고정 ring buffer와 blocking `poll`/`kqueue` wakeup을 먼저 구현해야 합니다.
+
 ## 개발환경 구성
 
 ### 공통 요구사항
@@ -249,6 +355,10 @@ int autobricks_vpn_client_run(const char *config_path);
 
 인증된 동시 세션 수는 `server.ini`의 `max_clients`로 설정합니다. 기본값은 64이고 현재 허용 범위는 1~1024입니다. 인증 전 handshake는 `max_pending_handshakes`(기본값 16, 허용 범위 1~256)로 별도 제한하며, 같은 출발지 IP에는 최대 2개만 허용하고 10초 안에 완료되지 않은 handshake는 제거합니다. 한도가 찬 경우 가장 오래된 미인증 handshake를 교체하므로 미인증 패킷이 인증된 세션 자리를 점유하지 않습니다.
 
+서버의 일반 unicast 경로는 UDP peer endpoint와 VPN IP를 각각 `HashMap`으로 인덱싱해 세션을 O(1)로 찾습니다. 인증서 fingerprint도 역방향 `HashMap`으로 VPN IP를 조회합니다. 전체 세션 순회는 broadcast/multicast 전달, timeout 정리와 관리 상태 snapshot에만 사용합니다.
+
+DTLS 쓰기가 `WouldBlock`이면 아직 전송되지 않은 내부 패킷을 세션별 송신 대기 queue에 보관합니다. queue는 세션당 최대 256패킷이며 가득 차면 가장 오래된 패킷을 제거합니다. 2초 이상 대기한 패킷은 폐기하고 한 event-loop 회차에 세션당 최대 32패킷만 처리해 한 클라이언트가 다른 세션의 송신을 독점하지 않게 합니다. 성공한 DTLS application record는 이 queue에서 재전송하지 않습니다.
+
 활성 세션은 트래픽 유무와 관계없이 `max_session_lifetime` 이후 제거되며 기본값은 3600초, 허용 범위는 60~604800초입니다. 클라이언트가 다시 연결할 때 전체 certificate 인증과 새 key 협상을 수행하므로 장기 세션의 인증 상태가 무기한 유지되지 않습니다.
 
 서버는 `config_reload_interval`마다 설정 파일의 `[client]` fingerprint 매핑을 다시 읽습니다. 기본값은 30초이고 허용 범위는 5~3600초입니다. 삭제되거나 변경된 binding의 활성 세션은 즉시 제거하며, 새 DTLS acceptor도 다시 만들어 갱신된 서버 인증서·개인키·CA 파일을 이후 handshake에 반영합니다. reload 검증이 실패하면 기존 정상 설정과 세션을 유지합니다.
@@ -260,11 +370,209 @@ sudo ./target/debug/vpn-server --config server.ini
 sudo ./target/debug/vpn-client --config client.ini
 ```
 
+## 성능 측정 기록
+
+성능 변경은 아래에 날짜별로 누적합니다. 이후 최적화에서도 기존 결과를 덮어쓰지 않고 새 날짜의 항목을 추가합니다. 비교 시에는 측정 장비, 경로, build profile, packet 크기, 방향과 반복 횟수를 함께 기록합니다.
+
+### 2026-09-18 - 초기 상태 회고
+
+초기 개발 빌드는 같은 Ubuntu 서버의 WireGuard 경로와 비교했을 때 파일 전송이 약 3배 느렸습니다. 이는 2026-09-18에 기록한 개발 과정의 회고값이며 당시의 정밀한 원시 측정 로그는 남아 있지 않습니다. 이후 release 빌드, TUN non-blocking 처리, OS별 I/O 분리, 세션 HashMap 인덱스, 제한된 송신 대기 queue와 Linux ICMP Redirect 차단을 적용했습니다.
+
+### 2026-09-18 - 공통 측정 환경
+
+- 클라이언트: Apple Silicon MacBook Air, macOS 14
+- 서버: `10.10.254.1`, Ubuntu 22.04, Linux `6.8.0-136-generic`, x86_64, 12 CPU
+- Autobricks VPN: client `10.8.1.2`, server `10.8.1.1`, UDP `17663`, DTLS 1.3, MTU 1350
+- WireGuard: 동일 클라이언트에서 동일 서버의 `10.10.254.1` 사용
+- Autobricks 서버: release build, wolfSSL 5.9.1 계열 `libwolfssl.so.44`
+- `iperf3`: macOS 3.21.1, Ubuntu 3.9
+
+### 2026-09-18 - Ping RTT
+
+| 단계 | 대상 | 표본 | 평균 RTT | 최소 | 최대 | 손실 |
+|---|---|---:|---:|---:|---:|---:|
+| HashMap/queue 변경 전 | Autobricks `10.8.1.1` | 29 | 16.33 ms | 8.588 ms | 25.216 ms | 0% |
+| 변경 직후 첫 측정 | Autobricks `10.8.1.1` | 13 | 18.44 ms | 11.477 ms | 27.280 ms | 0% |
+| 변경 후 안정화 측정 | Autobricks `10.8.1.1` | 24 | 13.01 ms | 7.547 ms | 20.588 ms | 0% |
+| 비교 측정 | WireGuard `10.10.254.1` | 30 | 14.25 ms | 8.739 ms | 18.954 ms | 0% |
+
+안정화 측정의 Autobricks 평균 RTT는 WireGuard와 유사했습니다. 작은 ICMP 패킷의 RTT는 인터넷·Wi-Fi jitter 영향을 크게 받으므로 터널 처리량 판단에는 SCP와 `iperf3` 결과를 함께 사용합니다.
+
+### 2026-09-18 - SCP 128 MiB 1차 측정
+
+SSH 압축을 비활성화하고 각 경로를 3회 교차 측정했습니다. 업로드와 다운로드 후 모든 파일의 크기와 SHA-256이 원본과 일치했습니다.
+
+| 방향 | Autobricks 개별 시간 | Autobricks 평균 | WireGuard 개별 시간 | WireGuard 평균 |
+|---|---|---:|---|---:|
+| macOS → 서버 | 4.95 / 5.07 / 5.16초 | 5.06초, 약 202 Mbps | 4.51 / 4.11 / 3.70초 | 4.11초, 약 249 Mbps |
+| 서버 → macOS | 4.51 / 4.56 / 4.62초 | 4.56초, 약 224 Mbps | 4.71 / 4.35 / 4.33초 | 4.46초, 약 229 Mbps |
+
+1차 측정에서 다운로드는 약 2% 차이였고 업로드는 WireGuard가 약 23% 높았습니다.
+
+### 2026-09-18 - SCP 실행 순서 반전
+
+1차 테스트의 순서 편향을 확인하기 위해 `WireGuard → Autobricks` 순서로 3회 반복했습니다. 파일 크기와 SHA-256은 모두 일치했습니다.
+
+| 경로 | 개별 업로드 시간 | 평균 시간 | 환산 처리량 |
+|---|---|---:|---:|
+| WireGuard | 3.85 / 3.89 / 3.94초 | 3.89초 | 약 263 Mbps |
+| Autobricks | 6.04 / 6.41 / 5.08초 | 5.84초 | 약 175 Mbps |
+
+두 SCP 업로드 테스트를 합친 6회 평균은 WireGuard 4.00초, 약 256 Mbps이고 Autobricks 5.45초, 약 188 Mbps입니다. 순서를 반대로 해도 WireGuard 업로드가 빨랐으므로 첫 결과는 단순한 warm-up 순서 효과가 아니었습니다.
+
+### 2026-09-18 - iperf3 TCP 단일 스트림
+
+각 방향을 15초 측정하고 초기 2초를 제외했습니다.
+
+| 방향 | Autobricks | WireGuard | Autobricks TCP 재전송 | WireGuard TCP 재전송 |
+|---|---:|---:|---:|---:|
+| macOS → 서버 | 244.7 Mbps | 294.7 Mbps | 126 | 5 |
+| 서버 → macOS | 271.3 Mbps | 248.6 Mbps | 567 | 1,730 |
+
+단일 스트림 업로드는 Autobricks가 약 17% 낮았고 다운로드는 약 9% 높았습니다.
+
+### 2026-09-18 - iperf3 TCP 4병렬 스트림
+
+각 방향을 10초 측정하고 초기 2초를 제외했습니다.
+
+| 방향 | Autobricks | WireGuard |
+|---|---:|---:|
+| macOS → 서버 | 247.1 Mbps | 289.3 Mbps |
+| 서버 → macOS | 307.3 Mbps | 303.0 Mbps |
+
+Autobricks 업로드에서 한 차례 121.4 Mbps가 측정됐지만 즉시 재측정하면 247.1 Mbps로 회복되어 일시적인 외부 경로 변동으로 분류했습니다. 247 Mbps 업로드 중 `vpn-server` CPU는 단일 코어 기준 약 40~75%였습니다.
+
+### 2026-09-18 - iperf3 UDP 250 Mbps
+
+내부 MTU에서 IP fragmentation을 피하기 위해 UDP payload를 1,200바이트로 지정하고 각 방향을 10초 측정했습니다.
+
+| 방향 | 경로 | 처리량 | 손실 | Jitter |
+|---|---|---:|---:|---:|
+| macOS → 서버 | Autobricks | 250.0 Mbps | 0.109% | 0.028 ms |
+| macOS → 서버 | WireGuard | 250.0 Mbps | 0.364% | 0.041 ms |
+| 서버 → macOS | Autobricks | 250.0 Mbps | 0% | 0.067 ms |
+| 서버 → macOS | WireGuard | 250.0 Mbps | 0% | 0.163 ms |
+
+250 Mbps에서는 두 VPN 모두 목표 처리량을 전달했고 Autobricks의 손실률과 jitter가 낮았습니다.
+
+### 2026-09-18 - iperf3 UDP 350 Mbps 한계 측정
+
+macOS에서 서버 방향으로 1,200바이트 UDP payload를 10초 전송했습니다.
+
+| 경로 | 송신률 | 손실 | Jitter |
+|---|---:|---:|---:|
+| Autobricks | 350.8 Mbps | 5.80% | 0.010 ms |
+| WireGuard | 350.0 Mbps | 12.95% | 0.018 ms |
+
+350 Mbps에서는 두 경로 모두 손실이 발생해 물리 네트워크 한계에 진입했습니다. Autobricks `vpn-server` CPU는 활성 구간에서 단일 코어 기준 약 56~74%였으므로 서버 CPU 100% 포화가 직접 한계는 아니었습니다.
+
+### 2026-09-18 - 결과와 다음 비교 항목
+
+- Ping RTT와 TCP 다운로드는 WireGuard와 동급입니다.
+- TCP 업로드는 Autobricks가 대략 15~17% 낮았습니다.
+- UDP 250 Mbps에서는 Autobricks가 WireGuard보다 낮은 손실률과 jitter를 보였습니다.
+- 350 Mbps UDP에서는 두 경로 모두 물리 경로 한계로 손실이 증가했습니다.
+- 다음 최적화 비교에서는 map 전체 재구성 제거, client `WouldBlock` queue, 조건부 `POLLOUT`, queue/drop 계측과 macOS TUN copy 축소의 효과를 각각 분리해 측정합니다.
+- 테스트용 `iperf3` daemon과 임시 firewall rule은 측정 직후 제거했습니다.
+
+### 2026-09-18 - client 송신 queue 적용 후 재측정
+
+macOS release client에 UDP `WouldBlock` 시 packet을 버리지 않는 bounded queue를 적용한 뒤 같은 `10.8.1.2 -> 10.8.1.1` 경로에서 다시 측정했습니다. queue는 최대 256 packet, TTL 2초, loop당 최대 32 packet을 전송하며, queue가 비어 있지 않을 때만 UDP `POLLOUT`을 감시합니다.
+
+| 항목 | 방향 | 결과 |
+|---|---|---:|
+| TCP 4병렬, 8초, 3회 평균 | macOS → 서버 | 245.0 Mbps |
+| TCP 4병렬, 8초, 3회 평균 | 서버 → macOS | 293.7 Mbps |
+| TCP 단일, 8초, 3회 평균 | macOS → 서버 | 277.7 Mbps |
+| TCP 단일, 8초, 1회 | 서버 → macOS | 266 Mbps |
+| UDP 250 Mbps, 10초 | macOS → 서버 | 0.19% loss, 0.032 ms jitter |
+| UDP 250 Mbps, 10초 | 서버 → macOS | 0% loss, 0.093 ms jitter |
+| UDP 350 Mbps, 10초, 1차 | macOS → 서버 | 15% loss, 0.014 ms jitter |
+| UDP 350 Mbps, 10초, 2차 | macOS → 서버 | 0.27% loss, 0.059 ms jitter |
+| UDP 350 Mbps, 10초, 1차 | 서버 → macOS | 19% loss, 0.032 ms jitter |
+| UDP 350 Mbps, 10초, 2차 | 서버 → macOS | 19% loss, 0.039 ms jitter |
+
+TCP 4병렬 결과는 queue 적용 전의 정방향 247.1 Mbps, 역방향 307.3 Mbps와 같은 범위이므로 이번 변경만으로 TCP 처리량 향상이 확인되지는 않았습니다. UDP 250 Mbps는 계속 안정적이지만 350 Mbps 정방향은 측정 간 편차가 크고, 역방향은 약 19% 손실이 반복됐습니다. client 송신 queue는 주로 macOS → 서버 방향의 순간적인 UDP socket backpressure를 보호하므로 서버 → macOS 손실은 해결하지 못합니다. 다음 분석에서는 client의 DTLS read와 TUN write 처리량, 수신 socket buffer, 한 번의 readiness당 처리하는 datagram 수와 queue 통계를 함께 계측해야 합니다.
+
+TCP 부하와 동시에 실시한 ping 20회는 손실 0%, 평균 26.707 ms, 최대 122.009 ms였습니다. 유휴 상태의 이전 평균 13.01 ms보다 지연과 편차가 증가했으므로 처리량뿐 아니라 부하 중 latency도 계속 비교합니다. 테스트 종료 후 `iperf3` daemon과 임시 TCP/UDP 5201 firewall rule을 제거했으며 VPN 서비스는 `active`, 재시작 횟수는 0이었습니다.
+
+### 2026-09-18 - server/client batch drain 비교
+
+클라이언트의 TUN 및 DTLS 입력과 서버의 TUN 입력은 wakeup당 최대 64 packet을 처리하고 있었습니다. 남아 있던 서버 UDP 단일 수신을 bounded batch로 변경한 뒤 batch 크기와 서버 `POLLOUT` 감시를 분리해 A/B 측정했습니다.
+
+- 서버 UDP batch 64와 조건부 `POLLOUT`: TCP 4병렬 정방향 평균 308 Mbps, 역방향 안정 구간 약 217 Mbps였습니다. 첫 역방향 측정은 19.5 Mbps까지 하락했습니다.
+- 서버 `POLLOUT` 제거, UDP batch 64: 역방향 206/226/230 Mbps였고 정방향은 94/126/193 Mbps로 측정 간 편차가 컸습니다. 따라서 `POLLOUT` 하나만이 회귀 원인은 아니었습니다.
+- 서버 UDP batch 16, TUN batch 64, 서버 `POLLOUT` 비활성화를 최종값으로 선택했습니다. UDP ACK burst가 TUN 송신을 오래 점유하지 않도록 UDP 쪽의 batch를 더 작게 제한했습니다.
+
+최종 상태에서 같은 wildcard `iperf3` server를 사용하고 매 측정마다 Autobricks와 WireGuard 순서로 교차 실행했습니다.
+
+| 프로토콜/부하 | 방향 | Autobricks | WireGuard | 비교 |
+|---|---|---:|---:|---:|
+| TCP 4병렬, 8초, 2회 평균 | macOS → 서버 | 344.5 Mbps | 304.0 Mbps | Autobricks +13.3% |
+| TCP 4병렬, 8초, 2회 평균 | 서버 → macOS | 247.5 Mbps | 291.0 Mbps | Autobricks -14.9% |
+| UDP 250 Mbps, 10초 | macOS → 서버 | 0.38% loss | 0.067% loss | 둘 다 249 Mbps 수신 |
+| UDP 250 Mbps, 10초 | 서버 → macOS | 0% loss | 0% loss | 둘 다 250 Mbps 수신 |
+| UDP 350 Mbps, 10초 | macOS → 서버 | 0.38% loss | 0.069% loss | 둘 다 약 348~349 Mbps 수신 |
+| UDP 350 Mbps, 10초 | 서버 → macOS | 19% loss, 283 Mbps | 11% loss, 310 Mbps | WireGuard 우세 |
+
+최종 유휴 ping 5회는 손실 0%, 평균 13.766 ms였습니다. 서버 UDP batch는 Autobricks의 정방향 TCP 처리량을 WireGuard 이상으로 높였지만, 서버 → macOS의 고부하 수신 경로는 계속 약 15% 낮은 TCP 처리량과 더 높은 UDP 손실을 보였습니다. 다음 최적화 대상은 macOS client의 UDP socket receive buffer, 한 번의 DTLS callback에서 소비되는 datagram 수, 복호화 후 TUN write의 backpressure와 copy 횟수입니다. 테스트 후 `iperf3` daemon과 Autobricks/WireGuard용 임시 TCP·UDP 5201 firewall rule 네 개를 모두 제거했으며 VPN 서비스는 `active`, 재시작 횟수는 0이었습니다.
+
+### 2026-09-18 - 서버 packet-path 고정 메모리 적용 최종 측정
+
+서버 UDP 수신을 1,024개의 사전 할당 datagram slot pool로 변경하고, 세션별 DTLS `WouldBlock` 송신 queue를 256개의 고정 slot ring으로 변경한 상태를 측정했습니다. 서버 release library SHA-256은 `290c236c0203e92aa8b6df4122b7c79c3bf937a9a496fa05ef88773e34b0377a`입니다. 측정 조건은 macOS `iperf3` 3.21.1과 Ubuntu `iperf3` 3.9, MTU 1350, UDP payload 1,200바이트이며 TCP/UDP 모두 초기 2초를 제외하고 8초 또는 10초 측정했습니다.
+
+| 프로토콜/부하 | 방향 | Autobricks | WireGuard | 비교 |
+|---|---|---:|---:|---:|
+| TCP 단일, 8초 | macOS → 서버 | 284 Mbps | 316 Mbps | Autobricks -10.1% |
+| TCP 4병렬, 8초 | macOS → 서버 | 305 Mbps | 260 Mbps | Autobricks +17.3% |
+| TCP 단일, 8초 | 서버 → macOS | 156 Mbps, 재측정 180 Mbps | 274 Mbps | 재측정 기준 -34.3% |
+| TCP 4병렬, 8초 | 서버 → macOS | 153 Mbps, 재측정 158 Mbps | 286 Mbps | 재측정 기준 -44.8% |
+| UDP 250 Mbps, 10초 | macOS → 서버 | 246 Mbps 수신 | 250 Mbps, 0% loss | Autobricks -1.6% |
+| UDP 250 Mbps, 10초 | 서버 → macOS | 245 Mbps, 0.11% loss | 250 Mbps, 0% loss | WireGuard 우세 |
+| UDP 350 Mbps, 10초 | macOS → 서버 | 292 Mbps 수신 | 312 Mbps 수신 | WireGuard +6.8% |
+| UDP 350 Mbps, 10초 | 서버 → macOS | 263 Mbps, 24% loss | 220 Mbps, 37% loss | Autobricks 수신률 우세 |
+
+정방향 TCP는 단일 스트림에서 WireGuard보다 10.1% 낮았지만 4병렬에서는 17.3% 높아 서버의 UDP 수신 slot pool이 정방향 병목을 만들지는 않았습니다. 반면 서버 → macOS TCP는 두 번 측정해도 이전 batch-drain 측정의 247.5 Mbps보다 낮은 153~180 Mbps였습니다. 고정 메모리 적용으로 packet별 Rust heap allocation은 제거했지만, macOS client의 DTLS 수신·복호화·utun write 직렬 경로 또는 측정 시점의 네트워크 상태가 역방향 처리량을 제한했을 가능성이 있습니다. 이번 측정만으로 두 원인을 분리할 수 없으므로 회귀를 해결됐다고 판단하지 않습니다.
+
+정방향 UDP에서는 macOS 3.21.1 client와 Ubuntu 3.9 server 조합이 수신 packet loss 개수를 `Unknown`으로 반환해 손실률을 임의 계산하지 않고 실제 수신 처리량만 기록했습니다. 역방향은 수신 측 macOS가 loss를 계산할 수 있어 해당 값을 기록했습니다. 측정 전 ping 10회는 손실 0%, 평균 15.324 ms였고 측정 후 ping 10회도 손실 0%, 평균 12.863 ms였습니다. 테스트 종료 후 `iperf3`와 임시 UFW 규칙 네 개를 제거했으며 `autobricks-vpn.service`는 `active`, `NRestarts=0` 상태를 유지했습니다.
+
 Ubuntu 서버가 `10.10.254.1`에서 실행 중이면 macOS client 설정의 `server_address`를 `10.10.254.1`로 지정하고 client를 실행합니다.
 
 디버깅 시 client 로그의 `[client] sending ClientHello` 다음에 `[client] DTLS handshake complete`가 표시되는지 확인합니다. handshake가 완료되지 않으면 서버/클라이언트가 같은 UDP port에 연결되어 있는지와 host firewall을 확인합니다. 정상 운용 시에는 packet별 로그를 출력하지 않습니다.
 
-서버와 클라이언트 설정은 각각 `server.ini`, `client.ini`의 `[server]`, `[client]` 섹션에서 관리합니다. VPN 바이너리에서는 `ca_file`이 필수이며 누락되거나 빈 값이면 시작을 거부합니다. 서버는 client certificate chain을, 클라이언트는 server certificate chain을 해당 CA로 검증합니다. 서버와 클라이언트는 시작 시 TUN IPv4 주소와 VPN 대역 route를 자동 설정합니다. macOS의 `ifconfig`/`route`, Linux의 `ip` 명령을 사용하므로 root 권한이 필요할 수 있습니다.
+서버와 클라이언트 설정은 각각 `server.ini`, `client.ini`의 `[server]`, `[client]` 섹션에서 관리합니다. VPN 바이너리에서는 `ca_file`이 필수이며 누락되거나 빈 값이면 시작을 거부합니다. 서버의 `ca_file`은 클라이언트 인증서를 검증하는 `trust-chain.pem`을 가리키며 PEM 형식의 Intermediate CA와 Root CA 인증서를 함께 담을 수 있습니다. 현재 개발 인증서는 Root CA가 직접 서명하므로 `trust-chain.pem`에는 Root CA 한 장만 들어 있습니다. 서버는 client certificate chain을, 클라이언트는 server certificate chain을 해당 CA로 검증합니다. 서버와 클라이언트는 시작 시 TUN IPv4 주소와 VPN 대역 route를 자동 설정합니다. macOS의 `ifconfig`/`route`, Linux의 `ip` 명령을 사용하므로 root 권한이 필요할 수 있습니다.
+
+### 서버 trust chain
+
+서버는 다음과 같이 클라이언트 인증서 검증용 trust chain을 지정합니다.
+
+```ini
+[server]
+certificate_file = certs/server-cert.pem
+private_key_file = certs/server-key.pem
+ca_file = certs/trust-chain.pem
+```
+
+`trust-chain.pem`은 서버 자신의 인증서 체인이 아니라 서버가 신뢰할 클라이언트 발급 CA 목록입니다. Intermediate CA를 사용하는 운영 환경에서는 발급 CA부터 Root CA 순서로 하나의 PEM 파일에 넣습니다.
+
+```pem
+-----BEGIN CERTIFICATE-----
+Intermediate CA certificate
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+Root CA certificate
+-----END CERTIFICATE-----
+```
+
+현재 저장소의 개발용 인증서는 `certs/ca-cert.pem` Root CA가 Leaf 인증서를 직접 서명하므로 `certs/trust-chain.pem`에는 해당 Root CA만 들어 있습니다. 향후 Intermediate CA를 도입해도 `server.ini`의 경로는 바꾸지 않고 `trust-chain.pem` 내용만 갱신합니다. 서버가 DTLS handshake에서 상대방에게 전송할 자신의 인증서 체인은 `certificate_file`의 별도 책임이며 `ca_file`과 혼용하지 않습니다.
+
+### 웹 실시간 세션 제어
+
+VPN 서버는 `control_socket`에 Unix domain socket을 열어 로컬 관리 웹과 통신합니다. `WATCH` 구독이 연결되면 현재 세션 snapshot을 한 번 전송하고, 이후 클라이언트 연결·재연결·종료로 연결 목록이 바뀔 때만 새 snapshot을 push합니다. 브라우저에는 Express가 이 스트림을 SSE로 전달하므로 주기적인 HTTP polling을 사용하지 않습니다.
+
+웹에서 연결 끊기를 실행하면 Express가 `DISCONNECT <VPN IP>` 명령을 control socket으로 전달합니다. 서버는 해당 DTLS 세션을 즉시 제거하고 `web_disconnect` 사유를 syslog에 기록합니다. 이 작업은 활성 연결만 종료하며 `server.ini`의 인증서 지문/IP 등록은 삭제하지 않으므로 클라이언트가 다시 인증하면 재접속할 수 있습니다.
+
+control socket은 `server.ini`의 `control_socket`으로 지정하며 기본값은 `/var/run/autobricks-vpn.sock`입니다. 생성 권한은 `0660`이므로 VPN 서버와 웹 프로세스는 socket을 읽고 쓸 수 있는 동일한 운영 그룹으로 실행해야 합니다.
 
 개인키 경로는 일반 파일이어야 합니다. Linux와 macOS에서는 소유자 외 group/other 권한이 설정된 개인키를 거부하므로 `chmod 600 certs/server-key.pem`과 같이 보호해야 합니다. Windows에서는 일반 파일 여부를 검사하며, 키 파일 ACL은 운영체제 관리 도구로 실행 계정만 접근할 수 있게 설정해야 합니다.
 
@@ -326,7 +634,7 @@ openssl x509 -in client-cert.pem -noout -fingerprint -sha256
 
 같은 외부 IP에서 유효한 DTLS cookie를 반환한 handshake가 rolling 1분 동안 30회에 도달하면 해당 IP를 10분간 차단합니다. ban과 시도 이력은 메모리에만 저장되어 서버 재시작 시 초기화되며, 10분이 지나면 자동 허용됩니다.
 
-Linux 서버는 시작할 때 내부에서 `sysctl`과 `iptables`를 실행해 IPv4 forwarding과 client 간 전달 규칙을 설정합니다. 정상 종료 시 `autobricks-vpn-client-forward`로 표시한 전용 iptables 규칙만 제거합니다. `ip_forward`는 Docker나 다른 네트워크 서비스도 공유하는 전역 상태이므로 서버 종료 시 이전 값으로 강제 복원하지 않습니다. 비정상 종료로 전용 규칙이 남더라도 다음 시작 시 같은 comment, interface와 network에 일치하는 규칙을 제거한 뒤 하나만 다시 등록합니다.
+Linux 서버는 시작할 때 내부에서 `sysctl`과 `iptables`를 실행해 IPv4 forwarding과 client 간 전달 규칙을 설정합니다. 같은 TUN 인터페이스에 연결된 VPN 클라이언트들은 서로 직접 전송할 수 없으므로 `net.ipv4.conf.<tun>.send_redirects=0`을 설정해 잘못된 ICMP Redirect Host 메시지를 차단합니다. 정상 종료 시 `autobricks-vpn-client-forward`로 표시한 전용 iptables 규칙만 제거합니다. `ip_forward`는 Docker나 다른 네트워크 서비스도 공유하는 전역 상태이므로 서버 종료 시 이전 값으로 강제 복원하지 않습니다. 비정상 종료로 전용 규칙이 남더라도 다음 시작 시 같은 comment, interface와 network에 일치하는 규칙을 제거한 뒤 하나만 다시 등록합니다.
 
 클라이언트의 `force_dns = true`는 모든 DNS 질의를 `dns_server`로 강제합니다. Linux는 TUN link에 `resolvectl`의 `~.` route를 설정하고, macOS는 활성 network service들의 DNS를 교체하며, Windows는 전체 namespace에 NRPT 규칙을 추가합니다. 정상 종료 시 이전 설정을 복구하거나 VPN 전용 규칙을 제거합니다. VPN 내부 전용 정책이므로 지정한 DNS가 외부 이름을 해석하지 못해도 fallback DNS를 사용하지 않습니다.
 
