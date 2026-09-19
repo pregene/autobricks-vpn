@@ -27,3 +27,4 @@ build/
 certs/
 docs/
 release/
+testdata/

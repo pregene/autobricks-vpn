@@ -19,13 +19,13 @@ export SERVER_TUN_IP=10.8.1.1 IPERF_PORT=5201
 ```sh
 export PING_COUNT=30 TEST_SECONDS=30 OMIT_SECONDS=2 PARALLEL_STREAMS=4
 export UDP_RATE=250M UDP_PAYLOAD_BYTES=1200 SERVER_USER=paul
-export UPLOAD_SOURCE=/tmp/avpn-tc02-128m.bin UPLOAD_TARGET=/tmp/avpn-tc02-128m.bin
-export DOWNLOAD_SOURCE=/tmp/avpn-tc03-128m.bin DOWNLOAD_TARGET=/tmp/avpn-tc03-128m.bin
+export UPLOAD_SOURCE=testdata/source-128MiB.bin UPLOAD_TARGET=/home/paul/autobricks_vpn/testdata/upload-received.bin
+export DOWNLOAD_SOURCE=/home/paul/autobricks_vpn/testdata/source-128MiB.bin DOWNLOAD_TARGET=testdata/download-received.bin
 ```
 
 `SERVER_TUN_IP`는 서버의 VPN 터널 주소, `IPERF_PORT`는 **터널 안에서만** 시험할 iperf3 수신 포트다. `SERVER_USER`는 서버 SSH 계정이다. 나머지 변수는 각각 ping 횟수, 전송·워밍업 시간, 병렬 연결 수, UDP 목표 전송률·데이터그램 크기, 시험 파일 경로다. 이 문서에 정한 값과 실제 환경이 다르면 명령 실행 전에 변경한 값을 시험 기록에 적고, 기존 결과와 같은 조건으로 비교하지 않는다. 각 케이스 시작 직전에 클라이언트에서 `RUN_ID=$(date -u '+%Y%m%dT%H%M%SZ')`를 실행해 회차 ID를 만든다. `status`는 명시된 판정에 따라 `PASS`/`FAIL`, 시험 자체를 완료하지 못하면 `INCONCLUSIVE`로 기록한다. 성능 수치의 단순 감소만으로 기능 실패라고 판정하지 않는다.
 
-파일 케이스 준비: 클라이언트에서 `test ! -e "$UPLOAD_SOURCE" && mkfile 128m "$UPLOAD_SOURCE"`, 서버에서 `test ! -e /tmp/avpn-tc03-128m.bin && truncate -s 128M /tmp/avpn-tc03-128m.bin`을 실행한다. 업로드 대상(서버의 `$UPLOAD_TARGET`)과 다운로드 대상(클라이언트의 `$DOWNLOAD_TARGET`)도 `test ! -e`로 부재를 확인한다. 어느 경로든 이미 있으면 덮어쓰지 말고 다른 고유 경로로 바꿔 기록한다. 서버의 iperf3가 아직 없다면 서버 터미널에서 `iperf3 -s -B "$SERVER_TUN_IP" -p "$IPERF_PORT"`를 실행하고 유지한다. 테스트용 TCP·UDP 포트에 클라이언트 터널 주소에서만 접근할 수 있어야 한다. 방화벽 변경은 서버 운영자의 승인된 절차로 진행한다.
+파일 케이스 준비는 최초 1회만 수행한다. M1 프로젝트 폴더에서 `mkdir -p testdata; test -e testdata/source-128MiB.bin || mkfile -n 128m testdata/source-128MiB.bin`, 서버 프로젝트 폴더에서 `mkdir -p testdata; test -e testdata/source-128MiB.bin || truncate -s 128M testdata/source-128MiB.bin`을 실행한다. 이후 원본 파일은 새로 만들거나 삭제하지 않고 재사용한다. 수신 파일은 같은 경로에 덮어쓰므로, 다른 용도의 파일이 없는지 최초 1회 확인한다. `testdata/`는 Git에서 제외한다. 서버의 iperf3 수신 포트는 계속 열어 두고, 기존 수신기가 있으면 재시작하지 않는다. 테스트용 TCP·UDP 포트에 클라이언트 터널 주소에서만 접근할 수 있어야 한다. 방화벽 변경은 서버 운영자의 승인된 절차로 진행한다.
 
 TCP 30초는 이 그룹의 **고정 관측 시간**이지 링크의 이론적 최대 속도 보증이 아니다. 각 1초 구간과 정상 완료 요약을 모두 기록한다. 비교 대상도 동일한 30초·초기 2초 제외 조건으로 측정한다. UDP는 `250M`으로 먼저 실행하고, 한계 시험을 할 때만 `UDP_RATE=350M`으로 새 회차를 시작한다.
 
@@ -60,7 +60,7 @@ TCP 30초는 이 그룹의 **고정 관측 시간**이지 링크의 이론적 �
 ### TC-02. 파일 업로드
 
 - 목표: 클라이언트에서 서버로 파일을 완전하고 정확하게 전달.
-- 서버 실행 명령: 전송 후 `sha256sum /tmp/avpn-tc02-128m.bin` 및 `stat -c %s /tmp/avpn-tc02-128m.bin`.
+- 서버 실행 명령: 전송 후 `sha256sum /home/paul/autobricks_vpn/testdata/upload-received.bin` 및 `stat -c %s /home/paul/autobricks_vpn/testdata/upload-received.bin`.
 - 클라이언트 실행 명령: 아래 `scp` 명령과 전송 전 `stat -f %z "$UPLOAD_SOURCE"`.
 - 로그 양식: `run_id,TC-02,source_bytes,target_bytes,source_digest,target_digest,elapsed_seconds,copy_exit_code,status`.
 - 명령: `scp -o Compression=no "$UPLOAD_SOURCE" "$SERVER_USER@$SERVER_TUN_IP:$UPLOAD_TARGET"`. 복사 전 클라이언트에서 `shasum -a 256 "$UPLOAD_SOURCE"`, 복사 후 서버에서 `sha256sum "$UPLOAD_TARGET"`을 실행한다.
@@ -70,7 +70,7 @@ TCP 30초는 이 그룹의 **고정 관측 시간**이지 링크의 이론적 �
 ### TC-03. 파일 다운로드
 
 - 목표: 서버에서 클라이언트로 파일을 완전하고 정확하게 전달.
-- 서버 실행 명령: 전송 전 `sha256sum /tmp/avpn-tc03-128m.bin` 및 `stat -c %s /tmp/avpn-tc03-128m.bin`.
+- 서버 실행 명령: 전송 전 `sha256sum /home/paul/autobricks_vpn/testdata/source-128MiB.bin` 및 `stat -c %s /home/paul/autobricks_vpn/testdata/source-128MiB.bin`.
 - 클라이언트 실행 명령: 아래 `scp` 명령과 전송 후 `stat -f %z "$DOWNLOAD_TARGET"`.
 - 로그 양식: `run_id,TC-03,source_bytes,target_bytes,source_digest,target_digest,elapsed_seconds,copy_exit_code,status`.
 - 명령: `scp -o Compression=no "$SERVER_USER@$SERVER_TUN_IP:$DOWNLOAD_SOURCE" "$DOWNLOAD_TARGET"`. 복사 전 서버에서 `sha256sum "$DOWNLOAD_SOURCE"`, 복사 후 클라이언트에서 `shasum -a 256 "$DOWNLOAD_TARGET"`을 실행한다.
