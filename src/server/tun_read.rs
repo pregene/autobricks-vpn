@@ -16,6 +16,7 @@ pub(super) fn spawn_tun_reader(
     let tun_reader = thread::Builder::new()
         .name("avpn-server-tun-read".to_string())
         .spawn(move || {
+            let _stop = super::StopOnDrop(Arc::clone(&tun_reader_active));
             let mut packet = [0u8; 2048];
             while RUNNING.load(Ordering::Acquire) && tun_reader_active.load(Ordering::Acquire) {
                 let mut descriptor = libc::pollfd {

@@ -121,6 +121,13 @@ const ERROR_WANT_READ: c_int = 2;
 const ERROR_WANT_WRITE: c_int = 3;
 const SOCKET_ERROR: c_int = -308;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DtlsIoResult {
+    Complete(usize),
+    WantRead,
+    WantWrite,
+}
+
 /// Encrypted application-data marker used to keep a DTLS session and its UDP/NAT mapping alive.
 /// Valid tunneled packets start with an IPv4 or IPv6 version nibble, so this cannot be a TUN packet.
 pub const KEEPALIVE_PACKET: &[u8] = &[0];
@@ -326,7 +333,7 @@ pub fn panic_gate<T>(label: &str, operation: impl FnOnce() -> io::Result<T>) -> 
     }
 }
 
-#[cfg_attr(not(test), link(name = "wolfssl"))]
+#[link(name = "wolfssl")]
 extern "C" {
     fn wolfSSL_Init() -> c_int;
     fn wolfSSL_CTX_new(method: *mut WolfMethod) -> *mut WolfCtx;
@@ -850,6 +857,27 @@ impl Dtls {
         }
     }
 
+    pub fn read_status(&mut self, buffer: &mut [u8]) -> io::Result<DtlsIoResult> {
+        unsafe {
+            let value = wolfSSL_read(
+                self.ssl,
+                buffer.as_mut_ptr() as *mut c_void,
+                buffer.len() as c_int,
+            );
+            if value > 0 {
+                self.last_read_error = 0;
+                return Ok(DtlsIoResult::Complete(value as usize));
+            }
+            let error = wolfSSL_get_error(self.ssl, value);
+            self.last_read_error = error;
+            match error {
+                ERROR_WANT_READ => Ok(DtlsIoResult::WantRead),
+                ERROR_WANT_WRITE => Ok(DtlsIoResult::WantWrite),
+                _ => Err(io::Error::other(format!("wolfSSL read failed: {error}"))),
+            }
+        }
+    }
+
     pub fn last_read_error_code(&self) -> c_int {
         self.last_read_error
     }
@@ -863,6 +891,25 @@ impl Dtls {
                 ),
                 self.ssl,
             )
+        }
+    }
+
+    pub fn write_status(&mut self, buffer: &[u8]) -> io::Result<DtlsIoResult> {
+        unsafe {
+            let value = wolfSSL_write(
+                self.ssl,
+                buffer.as_ptr() as *const c_void,
+                buffer.len() as c_int,
+            );
+            if value > 0 {
+                return Ok(DtlsIoResult::Complete(value as usize));
+            }
+            let error = wolfSSL_get_error(self.ssl, value);
+            match error {
+                ERROR_WANT_READ => Ok(DtlsIoResult::WantRead),
+                ERROR_WANT_WRITE => Ok(DtlsIoResult::WantWrite),
+                _ => Err(io::Error::other(format!("wolfSSL write failed: {error}"))),
+            }
         }
     }
     pub fn fingerprint(&self) -> io::Result<String> {
@@ -950,7 +997,6 @@ unsafe fn io_result(value: c_int, ssl: *mut WolfSsl) -> io::Result<usize> {
         }
     }
 }
-
 pub struct DtlsIo {
     fd: RawFd,
     peer: SocketAddrStorage,
