@@ -13,9 +13,49 @@ pub struct Queue<T> {
     not_empty: Condvar,
 }
 
+/// A non-blocking reservation of the queue's oldest item.
+///
+/// `pop` commits removal. Dropping the reservation without calling `pop`
+/// restores the item at the front, so a consumer can retry after `WouldBlock`.
+pub struct QueueFront<'a, T> {
+    queue: &'a Queue<T>,
+    item: Option<T>,
+}
+
+impl<T> QueueFront<'_, T> {
+    pub fn value(&self) -> &T {
+        self.item
+            .as_ref()
+            .expect("queue front reservation is valid")
+    }
+
+    pub fn pop(mut self) -> T {
+        self.item.take().expect("queue front reservation is valid")
+    }
+}
+
+impl<T> Drop for QueueFront<'_, T> {
+    fn drop(&mut self) {
+        let Some(item) = self.item.take() else {
+            return;
+        };
+        let mut state = self.queue.lock_state();
+        if state.closed {
+            return;
+        }
+        if state.items.len() == self.queue.capacity {
+            state.items.pop_back();
+        }
+        state.items.push_front(item);
+        drop(state);
+        self.queue.not_empty.notify_one();
+    }
+}
+
 struct State<T> {
     items: VecDeque<T>,
     closed: bool,
+    generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,6 +88,7 @@ impl<T> Queue<T> {
             state: Mutex::new(State {
                 items: VecDeque::with_capacity(capacity),
                 closed: false,
+                generation: 0,
             }),
             not_empty: Condvar::new(),
         })
@@ -69,6 +110,29 @@ impl<T> Queue<T> {
         self.lock_state().closed
     }
 
+    /// Generation used to wait for a new push or another external progress event.
+    pub fn generation(&self) -> u64 {
+        self.lock_state().generation
+    }
+
+    pub fn notify_change(&self) {
+        let mut state = self.lock_state();
+        state.generation = state.generation.wrapping_add(1);
+        drop(state);
+        self.not_empty.notify_all();
+    }
+
+    pub fn wait_for_change(&self, observed: u64) -> bool {
+        let mut state = self.lock_state();
+        while state.generation == observed && !state.closed {
+            state = self
+                .not_empty
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        !state.closed
+    }
+
     /// Enqueue an item without blocking the network producer.
     ///
     /// If the queue is full, the oldest item is removed before the new item is
@@ -84,6 +148,7 @@ impl<T> Queue<T> {
             None
         };
         state.items.push_back(item);
+        state.generation = state.generation.wrapping_add(1);
         drop(state);
         self.not_empty.notify_one();
         Ok(dropped)
@@ -104,6 +169,45 @@ impl<T> Queue<T> {
             return None;
         }
         state.items.pop_front()
+    }
+
+    /// Reserve the oldest item without committing its removal.
+    ///
+    /// Producers are not blocked while the returned reservation is processed.
+    /// Call `QueueFront::pop` only after the operation succeeds. Dropping the
+    /// reservation restores the item at the front for retry.
+    pub fn peek(&self) -> Option<QueueFront<'_, T>> {
+        let mut state = self.lock_state();
+        while state.items.is_empty() && !state.closed {
+            state = self
+                .not_empty
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        if state.closed {
+            return None;
+        }
+        let item = state.items.pop_front();
+        drop(state);
+        item.map(|item| QueueFront {
+            queue: self,
+            item: Some(item),
+        })
+    }
+
+    pub fn try_peek(&self) -> Result<QueueFront<'_, T>, TryPopError> {
+        let mut state = self.lock_state();
+        if let Some(item) = state.items.pop_front() {
+            return Ok(QueueFront {
+                queue: self,
+                item: Some(item),
+            });
+        }
+        if state.closed {
+            Err(TryPopError::Closed)
+        } else {
+            Err(TryPopError::Empty)
+        }
     }
 
     /// Dequeue an item, waiting up to `timeout` while the queue is empty.
@@ -143,6 +247,7 @@ impl<T> Queue<T> {
         }
         state.closed = true;
         state.items.clear();
+        state.generation = state.generation.wrapping_add(1);
         drop(state);
         self.not_empty.notify_all();
     }
@@ -222,5 +327,19 @@ mod tests {
         let queue = Queue::<u8>::new(1).unwrap();
         assert_eq!(queue.pop_timeout(Duration::from_millis(1)), None);
         assert!(!queue.is_closed());
+    }
+
+    #[test]
+    fn peek_restores_front_until_pop_commits_removal() {
+        let queue = Queue::new(2).unwrap();
+        queue.push(10).unwrap();
+        queue.push(20).unwrap();
+        {
+            let front = queue.peek().unwrap();
+            assert_eq!(*front.value(), 10);
+        }
+        let front = queue.peek().unwrap();
+        assert_eq!(front.pop(), 10);
+        assert_eq!(queue.pop(), Some(20));
     }
 }

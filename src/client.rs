@@ -1,7 +1,9 @@
 use autobricks_vpn::{
-    base::queue::Queue, base::worker::QueueWorker, ipv4_packet_addresses, ipv4_socket_addr_size,
-    is_keepalive_packet, panic_gate, parse_ini_section, socket_addr_storage, Config, DnsGuard,
-    Dtls, DtlsIo, SynchronizedDtls, Tun, KEEPALIVE_PACKET,
+    base::queue::Queue,
+    base::worker::{QueueWorker, WorkerSignal},
+    ipv4_packet_addresses, ipv4_socket_addr_size, is_keepalive_packet, panic_gate,
+    parse_ini_section, socket_addr_storage, Config, DnsGuard, Dtls, DtlsIo, SynchronizedDtls, Tun,
+    KEEPALIVE_PACKET,
 };
 use std::collections::HashMap;
 use std::io;
@@ -20,6 +22,23 @@ const SERVER_LIVENESS_TIMEOUT: Duration = Duration::from_secs(23);
 const HEALTH_PROBE_INTERVAL: Duration = Duration::from_secs(20);
 const HEALTH_PROBE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const RETRY_DELAY: Duration = Duration::from_secs(3);
+const DTLS_READ_DRAIN_LIMIT: usize = 4096;
+
+#[derive(Default)]
+struct ClientDiagnostics {
+    udp_read: AtomicU64,
+    tun_read: AtomicU64,
+    dtls_read_ok: AtomicU64,
+    dtls_read_would_block: AtomicU64,
+    dtls_read_want_read: AtomicU64,
+    dtls_read_want_write: AtomicU64,
+    dtls_read_socket_error: AtomicU64,
+    dtls_read_other: AtomicU64,
+    tun_write: AtomicU64,
+    icmp_echo_reply: AtomicU64,
+    dtls_write_ok: AtomicU64,
+    dtls_write_would_block: AtomicU64,
+}
 
 fn effective_keepalive_interval(configured: Duration) -> Duration {
     configured.min(HEALTH_PROBE_INTERVAL)
@@ -220,19 +239,22 @@ fn run_connection(
     verify_server_san_ip: bool,
 ) -> io::Result<()> {
     let (socket, mut dtls) = connect(server, port, config, verify_server_san_ip)?;
-    dtls.use_queued_receive()?;
+    const QUEUE_CAPACITY: usize = 1024;
+    let keepalive_interval = effective_keepalive_interval(keepalive_interval);
+    let encrypted_queue = Arc::new(Queue::new(QUEUE_CAPACITY).map_err(io::Error::other)?);
+    let plain_queue = Arc::new(Queue::new(QUEUE_CAPACITY).map_err(io::Error::other)?);
+    dtls.use_shared_receive_queue(Arc::clone(&encrypted_queue))?;
     let dtls = Arc::new(SynchronizedDtls::new(dtls));
     println!(
         "Rust VPN client connected to {server}:{port} through {}",
         tun.name()
     );
-    const QUEUE_CAPACITY: usize = 1024;
-    let keepalive_interval = effective_keepalive_interval(keepalive_interval);
-    let encrypted_queue = Arc::new(Queue::new(QUEUE_CAPACITY).map_err(io::Error::other)?);
-    let plain_queue = Arc::new(Queue::new(QUEUE_CAPACITY).map_err(io::Error::other)?);
+    let dtls_progress = Arc::new(WorkerSignal::new());
     let active = Arc::new(AtomicBool::new(true));
     let encrypted_drops = Arc::new(AtomicU64::new(0));
     let plain_drops = Arc::new(AtomicU64::new(0));
+    let diagnostics = Arc::new(ClientDiagnostics::default());
+    let diagnostic_enabled = std::env::var_os("AVPN_DIAG").is_some();
     let last_server_activity = Arc::new(Mutex::new(Instant::now()));
     let (error_sender, error_receiver) = mpsc::channel::<io::Error>();
 
@@ -241,6 +263,8 @@ fn run_connection(
     let udp_active = Arc::clone(&active);
     let udp_drops = Arc::clone(&encrypted_drops);
     let udp_errors = error_sender.clone();
+    let udp_progress = Arc::clone(&dtls_progress);
+    let udp_diagnostics = Arc::clone(&diagnostics);
     let udp_reader = thread::Builder::new()
         .name("avpn-client-udp-read".to_string())
         .spawn(move || {
@@ -258,13 +282,17 @@ fn run_connection(
                 }
                 loop {
                     match udp_socket.recv(&mut packet) {
-                        Ok(count) => match udp_queue.push(packet[..count].to_vec()) {
-                            Ok(Some(_)) => {
-                                udp_drops.fetch_add(1, Ordering::Relaxed);
+                        Ok(count) => {
+                            udp_diagnostics.udp_read.fetch_add(1, Ordering::Relaxed);
+                            match udp_queue.push(packet[..count].to_vec()) {
+                                Ok(Some(_)) => {
+                                    udp_drops.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Ok(None) => {}
+                                Err(_) => return,
                             }
-                            Ok(None) => {}
-                            Err(_) => return,
-                        },
+                            udp_progress.notify();
+                        }
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                         Err(error) => {
@@ -283,6 +311,7 @@ fn run_connection(
     let tun_active = Arc::clone(&active);
     let tun_drops = Arc::clone(&plain_drops);
     let tun_errors = error_sender.clone();
+    let tun_diagnostics = Arc::clone(&diagnostics);
     let tun_reader = thread::Builder::new()
         .name("avpn-client-tun-read".to_string())
         .spawn(move || {
@@ -313,9 +342,12 @@ fn run_connection(
                 match tun_reader_device.read_packet(&mut packet) {
                     Ok(count) if count > 0 => match tun_queue.push(packet[..count].to_vec()) {
                         Ok(Some(_)) => {
+                            tun_diagnostics.tun_read.fetch_add(1, Ordering::Relaxed);
                             tun_drops.fetch_add(1, Ordering::Relaxed);
                         }
-                        Ok(None) => {}
+                        Ok(None) => {
+                            tun_diagnostics.tun_read.fetch_add(1, Ordering::Relaxed);
+                        }
                         Err(_) => return,
                     },
                     Ok(_) => {}
@@ -340,6 +372,8 @@ fn run_connection(
     let decrypt_plain_queue = Arc::clone(&plain_queue);
     let decrypt_errors = error_sender.clone();
     let decrypt_activity = Arc::clone(&last_server_activity);
+    let decrypt_progress = Arc::clone(&dtls_progress);
+    let decrypt_diagnostics = Arc::clone(&diagnostics);
     let mut tun_writer = QueueWorker::spawn(
         "avpn-client-tun-write",
         Arc::clone(&encrypted_queue),
@@ -348,36 +382,70 @@ fn run_connection(
                 return;
             }
             let mut packet = [0u8; 2048];
-            let result = panic_gate("client DTLS read worker", || {
-                decrypt_dtls.with(|dtls| {
-                    dtls.push_incoming(datagram)?;
-                    dtls.read(&mut packet)
-                })
-            });
-            let count = match result {
-                Ok(count) => count,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
-                Err(error) => {
+            let mut incoming = Some(datagram);
+            for _ in 0..DTLS_READ_DRAIN_LIMIT {
+                let result = panic_gate("client DTLS read worker", || {
+                    decrypt_dtls.with(|dtls| {
+                        if let Some(datagram) = incoming.take() {
+                            dtls.push_incoming(datagram)?;
+                        }
+                        dtls.read(&mut packet)
+                    })
+                });
+                decrypt_progress.notify();
+                let count = match result {
+                    Ok(0) => break,
+                    Ok(count) => count,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        decrypt_diagnostics
+                            .dtls_read_would_block
+                            .fetch_add(1, Ordering::Relaxed);
+                        (match decrypt_dtls.with(|dtls| dtls.last_read_error_code()) {
+                            2 => &decrypt_diagnostics.dtls_read_want_read,
+                            3 => &decrypt_diagnostics.dtls_read_want_write,
+                            -308 => &decrypt_diagnostics.dtls_read_socket_error,
+                            _ => &decrypt_diagnostics.dtls_read_other,
+                        })
+                        .fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                    Err(error) => {
+                        decrypt_active.store(false, Ordering::Release);
+                        let _ = decrypt_errors.send(error);
+                        decrypt_plain_queue.close();
+                        return;
+                    }
+                };
+                decrypt_diagnostics
+                    .dtls_read_ok
+                    .fetch_add(1, Ordering::Relaxed);
+                if count >= 28 && packet[9] == 1 {
+                    let header_len = usize::from(packet[0] & 0x0f) * 4;
+                    if header_len < count && packet[header_len] == 0 {
+                        decrypt_diagnostics
+                            .icmp_echo_reply
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                *decrypt_activity
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+                if is_keepalive_packet(&packet[..count]) {
+                    continue;
+                }
+                if ipv4_packet_addresses(&packet[..count]).is_none() {
+                    eprintln!("[client] malformed IPv4 packet from server dropped");
+                    continue;
+                }
+                if let Err(error) = tun_writer_device.write_packet(&packet[..count]) {
                     decrypt_active.store(false, Ordering::Release);
                     let _ = decrypt_errors.send(error);
                     decrypt_plain_queue.close();
                     return;
                 }
-            };
-            *decrypt_activity
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
-            if is_keepalive_packet(&packet[..count]) {
-                return;
-            }
-            if ipv4_packet_addresses(&packet[..count]).is_none() {
-                eprintln!("[client] malformed IPv4 packet from server dropped");
-                return;
-            }
-            if let Err(error) = tun_writer_device.write_packet(&packet[..count]) {
-                decrypt_active.store(false, Ordering::Release);
-                let _ = decrypt_errors.send(error);
-                decrypt_plain_queue.close();
+                decrypt_diagnostics
+                    .tun_write
+                    .fetch_add(1, Ordering::Relaxed);
             }
         },
     )?;
@@ -386,26 +454,43 @@ fn run_connection(
     let encrypt_active = Arc::clone(&active);
     let encrypt_receive_queue = Arc::clone(&encrypted_queue);
     let encrypt_errors = error_sender.clone();
-    let mut udp_writer = QueueWorker::spawn(
+    let encrypt_diagnostics = Arc::clone(&diagnostics);
+    let mut udp_writer = QueueWorker::spawn_peek(
         "avpn-client-udp-write",
         Arc::clone(&plain_queue),
+        Arc::clone(&dtls_progress),
+        Duration::from_secs(2),
         move |packet| {
             if !encrypt_active.load(Ordering::Acquire) {
-                return;
+                return true;
             }
             match panic_gate("client DTLS write worker", || {
-                encrypt_dtls.with(|dtls| dtls.write(&packet))
+                encrypt_dtls.with(|dtls| dtls.write(packet))
             }) {
-                Ok(written) if written == packet.len() => {}
-                Ok(written) => eprintln!(
-                    "[client] partial DTLS write: {written}/{} bytes; packet dropped",
-                    packet.len()
-                ),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Ok(written) if written == packet.len() => {
+                    encrypt_diagnostics
+                        .dtls_write_ok
+                        .fetch_add(1, Ordering::Relaxed);
+                    true
+                }
+                Ok(written) => {
+                    eprintln!(
+                        "[client] partial DTLS write: {written}/{} bytes; packet dropped",
+                        packet.len()
+                    );
+                    true
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    encrypt_diagnostics
+                        .dtls_write_would_block
+                        .fetch_add(1, Ordering::Relaxed);
+                    false
+                }
                 Err(error) => {
                     encrypt_active.store(false, Ordering::Release);
                     let _ = encrypt_errors.send(error);
                     encrypt_receive_queue.close();
+                    true
                 }
             }
         },
@@ -414,8 +499,40 @@ fn run_connection(
     let mut last_keepalive = Instant::now();
     let mut last_probe = Instant::now();
     let mut probing = false;
+    let mut last_diagnostic = Instant::now();
     let mut result = Ok(());
     while RUNNING.load(Ordering::Acquire) && active.load(Ordering::Acquire) {
+        if diagnostic_enabled && last_diagnostic.elapsed() >= Duration::from_secs(1) {
+            let (incoming, callback_pop, callback_empty, callback_oversize) = dtls.with(|dtls| {
+                let incoming = dtls.queued_incoming_len();
+                let (pop, empty, oversize) = dtls.receive_callback_stats();
+                (incoming, pop, empty, oversize)
+            });
+            eprintln!(
+                "[client-diag] udp_rx={} tun_rx={} encrypted_q={} encrypted_drop={} dtls_incoming={} callback_pop={} callback_empty={} callback_oversize={} dtls_read_ok={} dtls_read_wouldblock={} want_read={} want_write={} socket_error={} read_other={} tun_tx={} icmp_reply={} plain_q={} plain_drop={} dtls_write_ok={} dtls_write_wouldblock={}",
+                diagnostics.udp_read.load(Ordering::Relaxed),
+                diagnostics.tun_read.load(Ordering::Relaxed),
+                encrypted_queue.len(),
+                encrypted_drops.load(Ordering::Relaxed),
+                incoming,
+                callback_pop,
+                callback_empty,
+                callback_oversize,
+                diagnostics.dtls_read_ok.load(Ordering::Relaxed),
+                diagnostics.dtls_read_would_block.load(Ordering::Relaxed),
+                diagnostics.dtls_read_want_read.load(Ordering::Relaxed),
+                diagnostics.dtls_read_want_write.load(Ordering::Relaxed),
+                diagnostics.dtls_read_socket_error.load(Ordering::Relaxed),
+                diagnostics.dtls_read_other.load(Ordering::Relaxed),
+                diagnostics.tun_write.load(Ordering::Relaxed),
+                diagnostics.icmp_echo_reply.load(Ordering::Relaxed),
+                plain_queue.len(),
+                plain_drops.load(Ordering::Relaxed),
+                diagnostics.dtls_write_ok.load(Ordering::Relaxed),
+                diagnostics.dtls_write_would_block.load(Ordering::Relaxed),
+            );
+            last_diagnostic = Instant::now();
+        }
         let server_idle = last_server_activity
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

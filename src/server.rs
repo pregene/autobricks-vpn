@@ -1,18 +1,19 @@
 use autobricks_vpn::{
-    base::queue::Queue, base::worker::QueueWorker, ipv4_destination, ipv4_in_cidr,
-    ipv4_is_broadcast, ipv4_packet_addresses, is_keepalive_packet, panic_gate, parse_ini_entries,
-    parse_ini_section, parse_ipv4_cidr, validate_client_bindings, validate_datagram_write, Config,
-    Dtls, DtlsIo, ForwardingGuard, IpRateLimiter, RateLimitDecision, SynchronizedDtls, Tun,
-    TunErrorAction, KEEPALIVE_PACKET,
+    base::queue::Queue,
+    base::worker::{QueueWorker, WorkerSignal},
+    ipv4_destination, ipv4_in_cidr, ipv4_is_broadcast, ipv4_packet_addresses, is_keepalive_packet,
+    panic_gate, parse_ini_entries, parse_ini_section, parse_ipv4_cidr, validate_client_bindings,
+    validate_datagram_write, Config, Dtls, DtlsIo, EncryptedDatagram, ForwardingGuard,
+    IpRateLimiter, RateLimitDecision, SynchronizedDtls, Tun, TunErrorAction, KEEPALIVE_PACKET,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io;
 use std::io::{Read, Write};
 use std::mem;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::RawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(windows)]
@@ -23,6 +24,12 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod session;
+mod socket;
+mod tun;
+use session::Session;
+use socket::{peer_ipv4, poll, receive_peer, same_peer, send_encrypted_datagram, socket_fd};
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("vpn-server supports Linux and macOS only");
 
@@ -31,6 +38,8 @@ const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PENDING_PER_IP: usize = 2;
 const SERVER_QUEUE_CAPACITY: usize = 4096;
+const SESSION_TX_QUEUE_CAPACITY: usize = 256;
+const SESSION_PACKET_TTL: Duration = Duration::from_secs(2);
 
 struct UdpDatagram {
     peer: libc::sockaddr_storage,
@@ -53,22 +62,6 @@ fn install_signal_handlers() {
 
 #[cfg(not(unix))]
 fn install_signal_handlers() {}
-
-struct Session {
-    dtls: SynchronizedDtls,
-    peer: libc::sockaddr_storage,
-    address: Ipv4Addr,
-    fingerprint: Option<String>,
-    established: bool,
-    established_at: Option<Instant>,
-    last_activity: Instant,
-    dtls_deadline: Option<Instant>,
-    bytes_tx: u64,
-    bytes_rx: u64,
-    packets_tx: u64,
-    packets_rx: u64,
-    disconnect_reason: &'static str,
-}
 
 struct ControlSocket {
     listener: UnixListener,
@@ -211,28 +204,6 @@ fn session_snapshot(sessions: &[Session]) -> String {
     output
 }
 
-impl Drop for Session {
-    fn drop(&mut self) {
-        if self.established {
-            let duration_seconds = self
-                .established_at
-                .map(|started| started.elapsed().as_secs())
-                .unwrap_or(0);
-            autobricks_vpn::syslog_connection_event(&format!(
-                "client disconnected vpn_ip={} fingerprint={} duration_seconds={} bytes_tx={} bytes_rx={} packets_tx={} packets_rx={} reason={}",
-                self.address,
-                self.fingerprint.as_deref().unwrap_or("unknown"),
-                duration_seconds,
-                self.bytes_tx,
-                self.bytes_rx,
-                self.packets_tx,
-                self.packets_rx,
-                self.disconnect_reason
-            ));
-        }
-    }
-}
-
 fn create_stateless_acceptor(fd: RawFd, config: &Config, cookie_secret: &[u8]) -> io::Result<Dtls> {
     let peer = unsafe { mem::zeroed() };
     let peer_size = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
@@ -304,61 +275,47 @@ fn boolean_value(values: &HashMap<String, String>, key: &str, default: bool) -> 
     }
 }
 
-fn receive_peer(fd: RawFd) -> io::Result<(libc::sockaddr_storage, libc::socklen_t, Vec<u8>)> {
-    let mut peer: libc::sockaddr_storage = unsafe { mem::zeroed() };
-    let mut length = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    let mut packet = [0u8; 2048];
-    let result = unsafe {
-        libc::recvfrom(
-            fd,
-            packet.as_mut_ptr() as *mut _,
-            packet.len(),
-            0,
-            &mut peer as *mut _ as *mut _,
-            &mut length,
-        )
-    };
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok((peer, length, packet[..result as usize].to_vec()))
-    }
+enum SendPacketResult {
+    Sent,
+    Retry,
+    RemoveSession,
 }
 
-fn same_peer(a: &libc::sockaddr_storage, b: &libc::sockaddr_storage) -> bool {
-    unsafe {
-        libc::memcmp(
-            a as *const _ as *const _,
-            b as *const _ as *const _,
-            mem::size_of::<libc::sockaddr_storage>(),
-        ) == 0
-    }
-}
-
-fn peer_ipv4(peer: &libc::sockaddr_storage) -> Option<Ipv4Addr> {
-    if peer.ss_family as libc::c_int != libc::AF_INET {
-        return None;
-    }
-    let peer = unsafe { &*(peer as *const _ as *const libc::sockaddr_in) };
-    Some(Ipv4Addr::from(peer.sin_addr.s_addr.to_ne_bytes()))
-}
-
-fn poll(fds: &mut [libc::pollfd], timeout: Duration) -> io::Result<()> {
-    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-    let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
-    if result < 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
-            Ok(())
-        } else {
-            Err(error)
+fn drain_encrypted_queue(
+    queue: &Queue<EncryptedDatagram>,
+    mut send: impl FnMut(&[u8]) -> io::Result<usize>,
+) -> io::Result<bool> {
+    loop {
+        let front = match queue.try_peek() {
+            Ok(front) => front,
+            Err(_) => return Ok(false),
+        };
+        if front.value().enqueued_at.elapsed() >= SESSION_PACKET_TTL {
+            front.pop();
+            continue;
         }
-    } else {
-        Ok(())
+        match send(&front.value().bytes) {
+            Ok(written) if written == front.value().bytes.len() => {
+                front.pop();
+            }
+            Ok(written) => {
+                let expected = front.value().bytes.len();
+                front.pop();
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!("partial UDP datagram write: {written}/{expected}"),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                drop(front);
+                return Ok(true);
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
-fn send_tunnel_packet(session: &mut Session, packet: &[u8]) -> bool {
+fn send_tunnel_packet(session: &mut Session, packet: &[u8]) -> SendPacketResult {
     match panic_gate("server DTLS write", || {
         session.dtls.with(|dtls| dtls.write(packet))
     }) {
@@ -366,22 +323,47 @@ fn send_tunnel_packet(session: &mut Session, packet: &[u8]) -> bool {
             session.last_activity = Instant::now();
             session.bytes_tx = session.bytes_tx.saturating_add(written as u64);
             session.packets_tx = session.packets_tx.saturating_add(1);
-            true
+            SendPacketResult::Sent
         }
         Ok(written) => {
             eprintln!(
-                "[server] partial DTLS write: {written}/{} bytes; packet dropped",
+                "[server] partial DTLS write: {written}/{} bytes",
                 packet.len()
             );
-            true
+            session.disconnect_reason = "partial_dtls_write";
+            SendPacketResult::RemoveSession
         }
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => true,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => SendPacketResult::Retry,
         Err(error) => {
             eprintln!("[server] DTLS session failed: {error}; removing client");
             session.disconnect_reason = "dtls_write_error";
-            false
+            SendPacketResult::RemoveSession
         }
     }
+}
+
+fn drain_session_plain(session: &mut Session) -> SendPacketResult {
+    while let Some((packet, queued_at)) = session.pending_plain.pop_front() {
+        if queued_at.elapsed() >= SESSION_PACKET_TTL {
+            continue;
+        }
+        match send_tunnel_packet(session, &packet) {
+            SendPacketResult::Sent => {}
+            SendPacketResult::Retry => {
+                session.pending_plain.push_front((packet, queued_at));
+                return SendPacketResult::Retry;
+            }
+            SendPacketResult::RemoveSession => return SendPacketResult::RemoveSession,
+        }
+    }
+    SendPacketResult::Sent
+}
+
+fn queue_session_plain(session: &mut Session, packet: Vec<u8>) {
+    if session.pending_plain.len() == SESSION_TX_QUEUE_CAPACITY {
+        session.pending_plain.pop_front();
+    }
+    session.pending_plain.push_back((packet, Instant::now()));
 }
 
 pub(crate) fn run(path: &str) -> io::Result<()> {
@@ -482,6 +464,7 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
     let plain_queue = Arc::new(
         Queue::new(SERVER_QUEUE_CAPACITY).map_err(|error| io::Error::other(error.to_string()))?,
     );
+    let dtls_progress = Arc::new(WorkerSignal::new());
     let active = Arc::new(AtomicBool::new(true));
     let encrypted_drops = Arc::new(AtomicU64::new(0));
     let plain_drops = Arc::new(AtomicU64::new(0));
@@ -492,6 +475,7 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
     let udp_reader_active = Arc::clone(&active);
     let udp_reader_drops = Arc::clone(&encrypted_drops);
     let udp_reader_errors = error_sender.clone();
+    let udp_reader_progress = Arc::clone(&dtls_progress);
     let udp_reader = thread::Builder::new()
         .name("avpn-server-udp-read".to_string())
         .spawn(move || {
@@ -529,6 +513,7 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
                                 Ok(None) => {}
                                 Err(_) => return,
                             }
+                            udp_reader_progress.notify();
                         }
                         Err(error)
                             if matches!(
@@ -549,72 +534,20 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
             }
         })?;
 
-    let tun_reader_device = Arc::clone(&tun);
-    let tun_reader_queue = Arc::clone(&plain_queue);
-    let tun_reader_active = Arc::clone(&active);
-    let tun_reader_drops = Arc::clone(&plain_drops);
-    let tun_reader_errors = error_sender.clone();
-    let tun_reader = thread::Builder::new()
-        .name("avpn-server-tun-read".to_string())
-        .spawn(move || {
-            let mut packet = [0u8; 2048];
-            while RUNNING.load(Ordering::Acquire) && tun_reader_active.load(Ordering::Acquire) {
-                let mut descriptor = libc::pollfd {
-                    fd: tun_reader_device.fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                if let Err(error) = poll(
-                    std::slice::from_mut(&mut descriptor),
-                    Duration::from_millis(100),
-                ) {
-                    tun_reader_active.store(false, Ordering::Release);
-                    let _ = tun_reader_errors.send(error);
-                    tun_reader_queue.close();
-                    return;
-                }
-                if descriptor.revents & libc::POLLNVAL != 0
-                    || descriptor.revents & (libc::POLLERR | libc::POLLHUP) != 0
-                {
-                    tun_reader_active.store(false, Ordering::Release);
-                    let _ = tun_reader_errors.send(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "TUN device reported a permanent poll error",
-                    ));
-                    tun_reader_queue.close();
-                    return;
-                }
-                if descriptor.revents & libc::POLLIN == 0 {
-                    continue;
-                }
-                match tun_reader_device.read_packet(&mut packet) {
-                    Ok(count) if count > 0 => match tun_reader_queue.push(packet[..count].to_vec())
-                    {
-                        Ok(Some(_)) => {
-                            tun_reader_drops.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Ok(None) => {}
-                        Err(_) => return,
-                    },
-                    Ok(_) => {}
-                    Err(error) => match autobricks_vpn::classify_tun_error(&error) {
-                        TunErrorAction::Retry | TunErrorAction::DropPacket => {}
-                        TunErrorAction::Fatal => {
-                            tun_reader_active.store(false, Ordering::Release);
-                            let _ = tun_reader_errors.send(error);
-                            tun_reader_queue.close();
-                            return;
-                        }
-                    },
-                }
-            }
-        })?;
+    let tun_reader = tun::spawn_tun_reader(
+        Arc::clone(&tun),
+        Arc::clone(&plain_queue),
+        Arc::clone(&active),
+        Arc::clone(&plain_drops),
+        error_sender.clone(),
+    )?;
 
     let writer_sessions = Arc::clone(&sessions);
     let writer_active = Arc::clone(&active);
     let writer_encrypted_queue = Arc::clone(&encrypted_queue);
-    let mut udp_writer = QueueWorker::spawn(
-        "avpn-server-udp-write",
+    let writer_signal = Arc::clone(&dtls_progress);
+    let mut encrypt_worker = QueueWorker::spawn(
+        "avpn-server-encrypt",
         Arc::clone(&plain_queue),
         move |packet| {
             if !writer_active.load(Ordering::Acquire) {
@@ -629,14 +562,9 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if (broadcast && allow_broadcast) || (multicast && allow_multicast) {
-                let mut index = 0;
-                while index < sessions.len() {
-                    if sessions[index].established
-                        && !send_tunnel_packet(&mut sessions[index], &packet)
-                    {
-                        sessions.swap_remove(index);
-                    } else {
-                        index += 1;
+                for session in sessions.iter_mut() {
+                    if session.established {
+                        queue_session_plain(session, packet.clone());
                     }
                 }
             } else if !broadcast && !multicast {
@@ -646,16 +574,86 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
                     .filter(|(_, session)| session.established && session.address == destination)
                     .max_by_key(|(_, session)| session.last_activity)
                 {
-                    if !send_tunnel_packet(&mut sessions[index], &packet) {
-                        sessions.swap_remove(index);
-                    }
+                    queue_session_plain(&mut sessions[index], packet);
                 }
             }
+            writer_signal.notify();
             if !writer_active.load(Ordering::Acquire) {
                 writer_encrypted_queue.close();
             }
         },
     )?;
+
+    let tx_socket = socket.try_clone()?;
+    let tx_sessions = Arc::clone(&sessions);
+    let tx_active = Arc::clone(&active);
+    let tx_signal = Arc::clone(&dtls_progress);
+    let udp_writer = thread::Builder::new()
+        .name("avpn-server-udp-write".to_string())
+        .spawn(move || {
+            let fd = socket_fd(&tx_socket);
+            while RUNNING.load(Ordering::Acquire) && tx_active.load(Ordering::Acquire) {
+                let observed = tx_signal.generation();
+                let mut sent_any = false;
+                let mut socket_blocked = false;
+                let mut remove = Vec::new();
+                {
+                    let mut sessions = tx_sessions
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    for (index, session) in sessions.iter_mut().enumerate() {
+                        if matches!(
+                            drain_session_plain(session),
+                            SendPacketResult::RemoveSession
+                        ) {
+                            remove.push(index);
+                            continue;
+                        }
+                        let queue_was_nonempty = !session.tx_queue.is_empty();
+                        match drain_encrypted_queue(&session.tx_queue, |packet| {
+                            send_encrypted_datagram(fd, &session.peer, session.peer_size, packet)
+                        }) {
+                            Ok(blocked) => {
+                                socket_blocked |= blocked;
+                                sent_any |= queue_was_nonempty && !blocked;
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "[server] UDP send failed for {}: {error}; removing client",
+                                    session.address
+                                );
+                                session.disconnect_reason = "udp_write_error";
+                                remove.push(index);
+                            }
+                        }
+                    }
+                    for index in remove.into_iter().rev() {
+                        sessions.swap_remove(index);
+                    }
+                }
+
+                if socket_blocked {
+                    let mut descriptor = libc::pollfd {
+                        fd,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    let _ = poll(std::slice::from_mut(&mut descriptor), SESSION_PACKET_TTL);
+                } else if !sent_any {
+                    let encrypted_pending = tx_sessions
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .iter()
+                        .any(|session| !session.tx_queue.is_empty());
+                    if !encrypted_pending
+                        && RUNNING.load(Ordering::Acquire)
+                        && tx_active.load(Ordering::Acquire)
+                    {
+                        tx_signal.wait(observed);
+                    }
+                }
+            }
+        })?;
     println!(
         "Rust multi-client VPN hub listening on {listen}:{port} through {}",
         tun.name()
@@ -892,10 +890,16 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
                             break 'server;
                         }
                     };
-                    let dtls = mem::replace(&mut stateless_acceptor, replacement);
+                    let mut dtls = mem::replace(&mut stateless_acceptor, replacement);
+                    let tx_queue = Arc::new(
+                        Queue::new(SESSION_TX_QUEUE_CAPACITY)
+                            .map_err(|error| io::Error::other(error.to_string()))?,
+                    );
+                    dtls.use_queued_send(Arc::clone(&tx_queue), Arc::clone(&dtls_progress))?;
                     let session = Session {
                         dtls: SynchronizedDtls::new(dtls),
                         peer,
+                        peer_size,
                         address: Ipv4Addr::UNSPECIFIED,
                         fingerprint: None,
                         established: false,
@@ -907,6 +911,8 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
                         packets_tx: 0,
                         packets_rx: 0,
                         disconnect_reason: "server_shutdown",
+                        tx_queue,
+                        pending_plain: VecDeque::with_capacity(SESSION_TX_QUEUE_CAPACITY),
                     };
                     sessions.push(session);
                     sessions.len() - 1
@@ -1019,9 +1025,12 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
                     session.dtls_deadline = Some(Instant::now() + timeout);
                 }
             } else {
-                let count = match panic_gate("client DTLS read", || {
+                let read_result = panic_gate("client DTLS read", || {
                     session.dtls.with(|dtls| dtls.read(&mut packet))
-                }) {
+                });
+                // A pending write may be waiting for this DTLS input to advance.
+                dtls_progress.notify();
+                let count = match read_result {
                     Ok(count) => count,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
                     Err(error) => {
@@ -1075,9 +1084,11 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
         }
     }
     active.store(false, Ordering::Release);
+    dtls_progress.notify();
     encrypted_queue.close();
     plain_queue.close();
-    let _ = udp_writer.stop();
+    let _ = encrypt_worker.stop();
+    let _ = udp_writer.join();
     let _ = udp_reader.join();
     let _ = tun_reader.join();
     let encrypted_drops = encrypted_drops.load(Ordering::Relaxed);
@@ -1091,12 +1102,40 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
     result
 }
 
-#[cfg(unix)]
-fn socket_fd(socket: &std::net::UdpSocket) -> RawFd {
-    socket.as_raw_fd()
-}
+#[cfg(test)]
+mod tests {
+    use super::{drain_encrypted_queue, EncryptedDatagram, Queue};
+    use std::io;
+    use std::time::Instant;
 
-#[cfg(windows)]
-fn socket_fd(socket: &std::net::UdpSocket) -> RawFd {
-    socket.as_raw_socket() as RawFd
+    fn packet(value: u8) -> EncryptedDatagram {
+        EncryptedDatagram {
+            bytes: vec![value],
+            enqueued_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn blocked_session_does_not_block_another_session_queue() {
+        let blocked = Queue::new(2).unwrap();
+        let ready = Queue::new(2).unwrap();
+        blocked.push(packet(1)).unwrap();
+        ready.push(packet(2)).unwrap();
+
+        assert!(drain_encrypted_queue(&blocked, |_| {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        })
+        .unwrap());
+
+        let mut sent = Vec::new();
+        assert!(!drain_encrypted_queue(&ready, |bytes| {
+            sent.extend_from_slice(bytes);
+            Ok(bytes.len())
+        })
+        .unwrap());
+
+        assert_eq!(blocked.len(), 1);
+        assert!(ready.is_empty());
+        assert_eq!(sent, vec![2]);
+    }
 }

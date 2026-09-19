@@ -13,7 +13,7 @@ use std::os::fd::RawFd;
 type RawFd = usize;
 use std::process::Command;
 use std::ptr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -358,8 +358,6 @@ extern "C" {
         kind: c_int,
         monitor: c_int,
     ) -> c_int;
-    #[cfg(target_os = "macos")]
-    fn wolfSSL_CTX_dtls_set_mtu(ctx: *mut WolfCtx, mtu: u16) -> c_int;
     #[cfg(feature = "dtls13")]
     fn wolfDTLSv1_3_server_method() -> *mut WolfMethod;
     #[cfg(feature = "dtls13")]
@@ -425,6 +423,7 @@ pub struct Dtls {
     io: Option<Box<DtlsIo>>,
     server: bool,
     nonblocking: bool,
+    last_read_error: c_int,
 }
 
 // SAFETY: `Dtls` exclusively owns its wolfSSL pointers and callback context.
@@ -564,16 +563,16 @@ impl Dtls {
                     ));
                 }
             }
-            #[cfg(target_os = "macos")]
-            if config.mtu > 0 {
-                wolfSSL_CTX_dtls_set_mtu(ctx, config.mtu);
-            }
+            // `config.mtu` is the inner TUN MTU. Keep wolfSSL's DTLS transport
+            // MTU independent so record headers and authentication data fit
+            // around a full-size tunneled IP packet.
             Ok(Self {
                 ctx,
                 ssl: ptr::null_mut(),
                 io: None,
                 server: config.server,
                 nonblocking: false,
+                last_read_error: 0,
             })
         }
     }
@@ -650,6 +649,48 @@ impl Dtls {
             .as_mut()
             .ok_or_else(|| io::Error::other("DTLS I/O is not initialized"))?;
         io.direct_receive = false;
+        Ok(())
+    }
+
+    /// Let the receive callback consume the worker's bounded queue directly.
+    pub fn use_shared_receive_queue(
+        &mut self,
+        queue: Arc<base::queue::Queue<Vec<u8>>>,
+    ) -> io::Result<()> {
+        let io = self
+            .io
+            .as_mut()
+            .ok_or_else(|| io::Error::other("DTLS I/O is not initialized"))?;
+        io.direct_receive = false;
+        io.incoming_shared = Some(queue);
+        Ok(())
+    }
+
+    /// Number of encrypted datagrams waiting inside the wolfSSL I/O callback.
+    pub fn queued_incoming_len(&self) -> usize {
+        self.io.as_ref().map_or(0, |io| {
+            io.incoming_shared
+                .as_ref()
+                .map_or_else(|| io.incoming.len(), |queue| queue.len())
+        })
+    }
+
+    pub fn receive_callback_stats(&self) -> (u64, u64, u64) {
+        self.io.as_ref().map_or((0, 0, 0), |io| {
+            (io.recv_pop, io.recv_empty, io.recv_oversize)
+        })
+    }
+
+    pub fn use_queued_send(
+        &mut self,
+        queue: Arc<base::queue::Queue<EncryptedDatagram>>,
+        signal: Arc<base::worker::WorkerSignal>,
+    ) -> io::Result<()> {
+        let io = self
+            .io
+            .as_mut()
+            .ok_or_else(|| io::Error::other("DTLS I/O is not initialized"))?;
+        io.use_queued_send(queue, signal);
         Ok(())
     }
 
@@ -790,15 +831,27 @@ impl Dtls {
 
     pub fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         unsafe {
-            io_result(
-                wolfSSL_read(
-                    self.ssl,
-                    buffer.as_mut_ptr() as *mut c_void,
-                    buffer.len() as c_int,
-                ),
+            let value = wolfSSL_read(
                 self.ssl,
-            )
+                buffer.as_mut_ptr() as *mut c_void,
+                buffer.len() as c_int,
+            );
+            if value >= 0 {
+                self.last_read_error = 0;
+                return Ok(value as usize);
+            }
+            let error = wolfSSL_get_error(self.ssl, value);
+            self.last_read_error = error;
+            if error == ERROR_WANT_READ || error == ERROR_WANT_WRITE || error == SOCKET_ERROR {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            } else {
+                Err(io::Error::other(format!("wolfSSL I/O failed: {error}")))
+            }
         }
+    }
+
+    pub fn last_read_error_code(&self) -> c_int {
+        self.last_read_error
     }
     pub fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         unsafe {
@@ -905,6 +958,22 @@ pub struct DtlsIo {
     direct_receive: bool,
     connected_send: bool,
     incoming: VecDeque<Vec<u8>>,
+    incoming_shared: Option<Arc<base::queue::Queue<Vec<u8>>>>,
+    recv_pop: u64,
+    recv_empty: u64,
+    recv_oversize: u64,
+    outgoing: Option<QueuedDtlsSend>,
+}
+
+#[derive(Debug)]
+pub struct EncryptedDatagram {
+    pub bytes: Vec<u8>,
+    pub enqueued_at: Instant,
+}
+
+struct QueuedDtlsSend {
+    queue: Arc<base::queue::Queue<EncryptedDatagram>>,
+    signal: Arc<base::worker::WorkerSignal>,
 }
 
 impl DtlsIo {
@@ -916,6 +985,11 @@ impl DtlsIo {
             direct_receive: false,
             connected_send: false,
             incoming: VecDeque::new(),
+            incoming_shared: None,
+            recv_pop: 0,
+            recv_empty: 0,
+            recv_oversize: 0,
+            outgoing: None,
         }
     }
 
@@ -927,11 +1001,24 @@ impl DtlsIo {
             direct_receive: true,
             connected_send: true,
             incoming: VecDeque::new(),
+            incoming_shared: None,
+            recv_pop: 0,
+            recv_empty: 0,
+            recv_oversize: 0,
+            outgoing: None,
         }
     }
 
     pub fn push(&mut self, packet: Vec<u8>) {
         self.incoming.push_back(packet);
+    }
+
+    pub fn use_queued_send(
+        &mut self,
+        queue: Arc<base::queue::Queue<EncryptedDatagram>>,
+        signal: Arc<base::worker::WorkerSignal>,
+    ) {
+        self.outgoing = Some(QueuedDtlsSend { queue, signal });
     }
 }
 
@@ -956,12 +1043,34 @@ unsafe extern "C" fn dtls_recv(
         let result = recv(io.fd, buffer, size, 0) as isize;
         return if result < 0 { -2 } else { result as c_int };
     }
+    if let Some(queue) = &io.incoming_shared {
+        let front = match queue.try_peek() {
+            Ok(front) => front,
+            Err(_) => {
+                io.recv_empty = io.recv_empty.saturating_add(1);
+                return -2;
+            }
+        };
+        if front.value().len() > size as usize {
+            io.recv_oversize = io.recv_oversize.saturating_add(1);
+            front.pop();
+            return -1;
+        }
+        let count = front.value().len();
+        ptr::copy_nonoverlapping(front.value().as_ptr(), buffer as *mut u8, count);
+        front.pop();
+        io.recv_pop = io.recv_pop.saturating_add(1);
+        return count as c_int;
+    }
     let Some(packet) = io.incoming.pop_front() else {
+        io.recv_empty = io.recv_empty.saturating_add(1);
         return -2;
     };
     if packet.len() > size as usize {
+        io.recv_oversize = io.recv_oversize.saturating_add(1);
         return -1;
     }
+    io.recv_pop = io.recv_pop.saturating_add(1);
     ptr::copy_nonoverlapping(packet.as_ptr(), buffer as *mut u8, packet.len());
     packet.len() as c_int
 }
@@ -972,7 +1081,22 @@ unsafe extern "C" fn dtls_send(
     size: c_int,
     context: *mut c_void,
 ) -> c_int {
-    let io = &*(context as *const DtlsIo);
+    let io = &mut *(context as *mut DtlsIo);
+    if let Some(outgoing) = &io.outgoing {
+        if size < 0 {
+            return -1;
+        }
+        let bytes = std::slice::from_raw_parts(buffer as *const u8, size as usize).to_vec();
+        let datagram = EncryptedDatagram {
+            bytes,
+            enqueued_at: Instant::now(),
+        };
+        if outgoing.queue.push(datagram).is_err() {
+            return -1;
+        }
+        outgoing.signal.notify();
+        return size;
+    }
     let result = if io.connected_send {
         #[cfg(unix)]
         {
