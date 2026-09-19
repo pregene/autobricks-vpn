@@ -52,7 +52,7 @@ const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PENDING_PER_IP: usize = 2;
 const SERVER_QUEUE_CAPACITY: usize = 4096;
-const SESSION_TX_QUEUE_CAPACITY: usize = 256;
+const SESSION_TX_QUEUE_CAPACITY: usize = 512;
 const SESSION_PACKET_TTL: Duration = Duration::from_secs(2);
 
 struct UdpDatagram {
