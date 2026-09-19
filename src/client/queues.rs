@@ -2,7 +2,7 @@ use autobricks_vpn::{base::queue::Queue, EncryptedDatagram};
 use std::io;
 use std::sync::Arc;
 
-const QUEUE_CAPACITY: usize = 1024;
+const QUEUE_CAPACITY: usize = 512;
 
 pub(super) struct ClientQueues {
     /// Ciphertext received from UDP, consumed only by the decrypt worker.
@@ -40,10 +40,10 @@ mod tests {
     #[test]
     fn owns_four_independent_bounded_queues() {
         let queues = ClientQueues::new().unwrap();
-        assert_eq!(queues.encrypted_rx.capacity(), 1024);
-        assert_eq!(queues.tun_write.capacity(), 1024);
-        assert_eq!(queues.raw_tx.capacity(), 1024);
-        assert_eq!(queues.enc_tx.capacity(), 1024);
+        assert_eq!(queues.encrypted_rx.capacity(), 512);
+        assert_eq!(queues.tun_write.capacity(), 512);
+        assert_eq!(queues.raw_tx.capacity(), 512);
+        assert_eq!(queues.enc_tx.capacity(), 512);
         queues.encrypted_rx.push(vec![1]).unwrap();
         assert_eq!(queues.encrypted_rx.len(), 1);
         assert!(queues.tun_write.is_empty());
