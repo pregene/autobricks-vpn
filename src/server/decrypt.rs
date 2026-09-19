@@ -80,6 +80,75 @@ fn run(context: DecryptContext) -> io::Result<()> {
     let mut result = Ok(());
     'server: while RUNNING.load(Ordering::Acquire) && active.load(Ordering::Acquire) {
         let observed = udp_rx_queue.generation();
+        let pending_session_input = {
+            let mut sessions = sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for session in sessions.iter_mut().filter(|session| session.established) {
+                let queued = session.dtls.with(|dtls| dtls.queued_incoming_len());
+                if queued == 0 && !session.drain_pending {
+                    continue;
+                }
+                let mut packet = [0u8; 2048];
+                let read_result = panic_gate("client DTLS read", || {
+                    session.dtls.with(|dtls| {
+                        let before = dtls.receive_callback_stats().0;
+                        let result = dtls.read_status(&mut packet);
+                        let consumed = dtls.receive_callback_stats().0 > before;
+                        result.map(|status| (status, consumed))
+                    })
+                });
+                dtls_progress.notify();
+                retry_requested.store(true, Ordering::Release);
+                tun_read_queue.notify_change();
+                match read_result {
+                    Ok((DtlsIoResult::Complete(count), _)) if count > 0 => {
+                        session.drain_pending = true;
+                        if is_keepalive_packet(&packet[..count]) {
+                            session.last_activity = Instant::now();
+                            super::encrypt::queue_session_plain(session, KEEPALIVE_PACKET.to_vec());
+                            tun_read_queue.notify_change();
+                            continue;
+                        }
+                        if let Some((source, destination)) = ipv4_packet_addresses(&packet[..count])
+                        {
+                            let broadcast =
+                                ipv4_is_broadcast(destination, network_address, network_prefix);
+                            let multicast = destination.is_multicast();
+                            let destination_allowed = (!broadcast && !multicast)
+                                || (broadcast && allow_broadcast)
+                                || (multicast && allow_multicast);
+                            if source == session.address && destination_allowed {
+                                session.bytes_rx = session.bytes_rx.saturating_add(count as u64);
+                                session.packets_rx = session.packets_rx.saturating_add(1);
+                                match tun_write_queue.push(packet[..count].to_vec()) {
+                                    Ok(Some(_)) => eprintln!(
+                                        "[server] TUN write queue overflow; oldest packet dropped"
+                                    ),
+                                    Ok(None) => session.last_activity = Instant::now(),
+                                    Err(_) => break 'server,
+                                }
+                            }
+                        }
+                    }
+                    Ok((DtlsIoResult::WantRead | DtlsIoResult::Complete(_), _)) => {
+                        session.drain_pending = false;
+                    }
+                    Ok((DtlsIoResult::WantWrite, _)) => {
+                        session.drain_pending = true;
+                    }
+                    Err(error) => {
+                        session.drain_pending = false;
+                        eprintln!("[server] client DTLS read failed: {error}; retaining session until timeout");
+                    }
+                }
+            }
+            sessions.iter().any(|session| {
+                session.established
+                    && (session.drain_pending
+                        || session.dtls.with(|dtls| dtls.queued_incoming_len() > 0))
+            })
+        };
         handshake_limiter.purge(Instant::now());
         while let Ok((new_bindings, new_acceptor)) = reload_receiver.try_recv() {
             bindings = new_bindings;
@@ -92,7 +161,11 @@ fn run(context: DecryptContext) -> io::Result<()> {
         let next = match udp_rx_queue.try_pop() {
             Ok(datagram) => Some(datagram),
             Err(TryPopError::Empty) => {
-                udp_rx_queue.wait_for_change(observed);
+                if pending_session_input {
+                    thread::yield_now();
+                } else {
+                    udp_rx_queue.wait_for_change(observed);
+                }
                 None
             }
             Err(TryPopError::Closed) => break,
@@ -103,7 +176,6 @@ fn run(context: DecryptContext) -> io::Result<()> {
             packet: incoming,
         }) = next
         {
-            let mut packet = [0u8; 2048];
             let mut sessions = sessions
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -227,6 +299,7 @@ fn run(context: DecryptContext) -> io::Result<()> {
                         established_at: None,
                         last_activity: Instant::now(),
                         dtls_deadline: None,
+                        drain_pending: false,
                         bytes_tx: 0,
                         bytes_rx: 0,
                         packets_tx: 0,
@@ -348,47 +421,6 @@ fn run(context: DecryptContext) -> io::Result<()> {
                     let timeout = session.dtls.with(|dtls| dtls.current_timeout());
                     session.dtls_deadline = Some(Instant::now() + timeout);
                     control_wake.notify();
-                }
-            } else {
-                let read_result = panic_gate("client DTLS read", || {
-                    session.dtls.with(|dtls| dtls.read_status(&mut packet))
-                });
-                // A pending write may be waiting for this DTLS input to advance.
-                dtls_progress.notify();
-                retry_requested.store(true, Ordering::Release);
-                tun_read_queue.notify_change();
-                let count = match read_result {
-                    Ok(DtlsIoResult::Complete(count)) => count,
-                    Ok(DtlsIoResult::WantRead) => continue,
-                    Ok(DtlsIoResult::WantWrite) => continue,
-                    Err(error) => {
-                        eprintln!("[server] client DTLS read failed: {error}; retaining session until timeout");
-                        continue;
-                    }
-                };
-                if is_keepalive_packet(&packet[..count]) {
-                    session.last_activity = Instant::now();
-                    super::encrypt::queue_session_plain(session, KEEPALIVE_PACKET.to_vec());
-                    tun_read_queue.notify_change();
-                    continue;
-                }
-                if let Some((source, destination)) = ipv4_packet_addresses(&packet[..count]) {
-                    let broadcast = ipv4_is_broadcast(destination, network_address, network_prefix);
-                    let multicast = destination.is_multicast();
-                    let destination_allowed = (!broadcast && !multicast)
-                        || (broadcast && allow_broadcast)
-                        || (multicast && allow_multicast);
-                    if source == session.address && destination_allowed {
-                        session.bytes_rx = session.bytes_rx.saturating_add(count as u64);
-                        session.packets_rx = session.packets_rx.saturating_add(1);
-                        match tun_write_queue.push(packet[..count].to_vec()) {
-                            Ok(Some(_)) => eprintln!(
-                                "[server] TUN write queue overflow; oldest packet dropped"
-                            ),
-                            Ok(None) => session.last_activity = Instant::now(),
-                            Err(_) => break 'server,
-                        }
-                    }
                 }
             }
         }

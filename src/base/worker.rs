@@ -169,6 +169,42 @@ impl<T: Send + 'static> QueueWorker<T> {
         })
     }
 
+    /// Keep revisiting an unconsumed front item; wait only when the queue is empty.
+    pub fn spawn_scan_peek(
+        name: impl Into<String>,
+        queue: Arc<Queue<T>>,
+        mut process: impl FnMut(&T) -> bool + Send + 'static,
+    ) -> io::Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_queue = Arc::clone(&queue);
+        let worker_stop = Arc::clone(&stop);
+        let handle = thread::Builder::new()
+            .name(name.into())
+            .spawn(move || loop {
+                if worker_stop.load(Ordering::Acquire) {
+                    break;
+                }
+                let Some(front) = worker_queue.peek() else {
+                    break;
+                };
+                if worker_stop.load(Ordering::Acquire) {
+                    break;
+                }
+                if process(front.value()) {
+                    front.pop();
+                } else {
+                    drop(front);
+                    thread::yield_now();
+                }
+            })?;
+        Ok(Self {
+            queue,
+            stop,
+            handle: Some(handle),
+            retry_signal: None,
+        })
+    }
+
     pub fn queue(&self) -> &Arc<Queue<T>> {
         &self.queue
     }
@@ -217,7 +253,10 @@ impl<T> Drop for QueueWorker<T> {
 mod tests {
     use super::super::queue::Queue;
     use super::{QueueWorker, WorkerSignal};
-    use std::sync::{mpsc, Arc};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc,
+    };
     use std::time::Duration;
 
     #[test]
@@ -268,6 +307,28 @@ mod tests {
         assert_eq!(queue.push(2), Ok(None));
         let elapsed = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(elapsed >= Duration::from_millis(20));
+        worker.stop().unwrap();
+    }
+
+    #[test]
+    fn scan_peek_retries_front_without_new_push_or_timeout_drop() {
+        let queue = Arc::new(Queue::new(8).unwrap());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (sender, receiver) = mpsc::channel();
+        let attempts_worker = Arc::clone(&attempts);
+        let mut worker =
+            QueueWorker::spawn_scan_peek("scan-peek-test", Arc::clone(&queue), move |item| {
+                let count = attempts_worker.fetch_add(1, Ordering::Relaxed) + 1;
+                if count < 3 {
+                    return false;
+                }
+                sender.send(*item).unwrap();
+                true
+            })
+            .unwrap();
+        queue.push(42).unwrap();
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(1)).unwrap(), 42);
+        assert!(attempts.load(Ordering::Relaxed) >= 3);
         worker.stop().unwrap();
     }
 }

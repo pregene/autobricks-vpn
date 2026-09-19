@@ -208,8 +208,8 @@ fn run_connection(
     let encrypted_queue = Arc::clone(&queues.encrypted_rx);
     let plain_queue = Arc::clone(&queues.raw_tx);
     let keepalive_interval = effective_keepalive_interval(keepalive_interval);
-    // The worker owns this queue. The wolfSSL callback consumes only DtlsIo.incoming.
-    dtls.use_queued_receive()?;
+    // The receive callback commits a datagram only when wolfSSL actually reads it.
+    dtls.use_shared_receive_queue(Arc::clone(&encrypted_queue))?;
     let udp_write_progress = Arc::new(WorkerSignal::new());
     dtls.use_queued_send(Arc::clone(&queues.enc_tx), Arc::clone(&udp_write_progress))?;
     let dtls = Arc::new(SynchronizedDtls::new(dtls));
@@ -243,7 +243,7 @@ fn run_connection(
         Arc::clone(&diagnostics),
         error_sender.clone(),
     )?;
-    let mut decrypt_worker = decrypt::spawn(decrypt::DecryptContext {
+    let decrypt_worker = decrypt::spawn(decrypt::DecryptContext {
         queue: Arc::clone(&encrypted_queue),
         tun_write_queue: Arc::clone(&queues.tun_write),
         dtls: Arc::clone(&dtls),
@@ -359,7 +359,7 @@ fn run_connection(
     active.store(false, Ordering::Release);
     queues.close();
     dtls_progress.notify();
-    let _ = decrypt_worker.stop();
+    let _ = decrypt_worker.join();
     let _ = encrypt_worker.stop();
     let _ = udp_reader.join();
     let _ = tun_reader.join();

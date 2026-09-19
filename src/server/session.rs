@@ -14,6 +14,7 @@ pub(super) struct Session {
     pub(super) established_at: Option<Instant>,
     pub(super) last_activity: Instant,
     pub(super) dtls_deadline: Option<Instant>,
+    pub(super) drain_pending: bool,
     pub(super) bytes_tx: u64,
     pub(super) bytes_rx: u64,
     pub(super) packets_tx: u64,

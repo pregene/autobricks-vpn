@@ -152,12 +152,19 @@ pub(super) fn spawn(
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 flush_pending(&mut list);
+                let pending = list.iter().any(|session| !session.raw_tx_queue.is_empty());
                 drop(list);
                 signal.notify();
                 if queue.is_closed() {
                     break;
                 }
-                queue.wait_for_change(observed);
+                if pending {
+                    // A WANT status keeps the front packet. Visit every session again;
+                    // a busy session must not put the whole encrypt worker to sleep.
+                    thread::yield_now();
+                } else {
+                    queue.wait_for_change(observed);
+                }
             }
         })
 }
