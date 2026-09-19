@@ -48,9 +48,10 @@ Copyright © 2026 Autobricks.co.kr. All rights reserved.
 
 ## 서버·클라이언트 패킷 처리 구성
 
-### 현재 구현: 4-thread I/O pipeline
+### 현재 구현: 클라이언트 6-thread I/O pipeline
 
-서버와 클라이언트의 packet path는 UDP Read, TUN Read, TUN Write, UDP Write의 네 역할로 분리합니다. 두 Read thread는 입력을 읽어 bounded queue에 넣고 작업 thread를 깨우는 일만 수행합니다. 따라서 DTLS 암복호화 또는 출력 장치가 느려져도 UDP와 TUN 입력을 계속 읽을 수 있습니다.
+클라이언트는 단일 DTLS 세션을 사용하며, UDP/TUN 읽기, 복호화·암호화 작업, UDP/TUN 쓰기를 각각 분리합니다. 두 Read thread는 입력을 읽어 bounded queue에 넣고 작업 thread를 깨우는 일만 수행합니다.
+파일별 역할과 큐 경계는 [CLIENT.md](CLIENT.md)에 정리했습니다.
 
 ```mermaid
 flowchart LR
@@ -58,14 +59,18 @@ flowchart LR
         CUDP[(connected UDP socket)]
         CUR["Thread 1<br/>UDP Read<br/>drain until WouldBlock"]
         CEQ["Queue encrypted_rx<br/>capacity 1024<br/>Mutex + Condvar"]
-        CTW["Thread 2<br/>DTLS decrypt + TUN Write"]
+        CDW["Thread 2<br/>DTLS Decrypt"]
+        CTQ["Queue tun_write"]
+        CTW["Thread 3<br/>TUN Write"]
         UTUN[(utun)]
-        CTR["Thread 3<br/>TUN Read"]
-        CPQ["Queue plain_tx<br/>capacity 1024<br/>Mutex + Condvar"]
-        CUW["Thread 4<br/>DTLS encrypt + UDP Write"]
+        CTR["Thread 4<br/>TUN Read"]
+        CPQ["Queue raw_tx<br/>capacity 1024<br/>Mutex + Condvar"]
+        CEW["Thread 5<br/>DTLS Encrypt"]
+        CXQ["Queue enc_tx"]
+        CUW["Thread 6<br/>UDP Write"]
 
-        CUDP --> CUR --> CEQ --> CTW --> UTUN
-        UTUN --> CTR --> CPQ --> CUW --> CUDP
+        CUDP --> CUR --> CEQ --> CDW --> CTQ --> CTW --> UTUN
+        UTUN --> CTR --> CPQ --> CEW --> CXQ --> CUW --> CUDP
     end
 
     subgraph Server[Linux server]
@@ -101,8 +106,9 @@ Application
   -> macOS IP stack
   -> utun
   -> client TUN Read
-  -> plain TX queue
+  -> raw TX queue
   -> client wolfSSL DTLS encrypt
+  -> encrypted TX queue
   -> client UDP Write
   -> Internet UDP
   -> server UDP Read
@@ -128,8 +134,9 @@ Server service / remote VPN client
   -> Internet UDP
   -> client UDP Read
   -> encrypted RX queue
-  -> client DTLS decrypt / TUN Write
+  -> client DTLS decrypt
   -> IPv4 packet validation
+  -> TUN write queue
   -> utun write
   -> macOS IP stack
   -> Application
@@ -325,7 +332,7 @@ Windows TUN adapter는 `wintun` crate로 생성하며 관리자 권한이 필요
 
 ## API
 
-실제 서버와 클라이언트 구현은 각각 `src/server.rs`, `src/client.rs`에 있으며 `src/lib.rs`가 다음 C ABI 함수를 export합니다. 공개 선언은 `include/autobricks_vpn.h`에 있습니다.
+서버 구현은 `src/server.rs`와 `src/server/`, 클라이언트 구현은 `src/client/mod.rs`와 `src/client/`에 있으며 `src/lib.rs`가 다음 C ABI 함수를 export합니다. 공개 선언은 `include/autobricks_vpn.h`에 있습니다.
 
 ```c
 int autobricks_vpn_server_run(const char *config_path);
