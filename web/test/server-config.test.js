@@ -22,6 +22,9 @@ test("reads only the TCP port setting needed by the local web listener", () => {
       listenAddress: "0.0.0.0",
       port: 4433,
       controlSocket: "/var/run/autobricks-vpn.sock",
+      vpnAddress: "10.8.1.1",
+      vpnNetwork: "10.8.1.0/24",
+      mtu: 1200,
     });
   } finally {
     fs.rmSync(directory, { recursive: true });
@@ -41,6 +44,37 @@ test("adds and removes client bindings without changing the server section", () 
 
     config.removeClient("10.8.1.2");
     assert.deepEqual(config.listClients(), [{ vpnAddress: "10.8.1.3", fingerprint: "b".repeat(64) }]);
+  } finally {
+    fs.rmSync(directory, { recursive: true });
+  }
+});
+
+test("uses the configured VPN network for client addresses", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "autobricks-web-test-"));
+  const configPath = path.join(directory, "server.ini");
+  fs.writeFileSync(configPath, SAMPLE.replace("port = 4433", "port = 4433\nvpn_address = 10.9.1.1\nvpn_network = 10.9.1.0/24"));
+  const config = new ServerConfig(configPath);
+  try {
+    config.saveClient({ vpnAddress: "10.9.1.4", fingerprint: "b".repeat(64) });
+    assert.equal(config.listClients().at(-1).vpnAddress, "10.9.1.4");
+    assert.throws(() => config.saveClient({ vpnAddress: "10.8.1.4", fingerprint: "c".repeat(64) }), /10.9.1.0\/24/);
+  } finally {
+    fs.rmSync(directory, { recursive: true });
+  }
+});
+
+test("stores optional login only on the server and preserves it during other edits", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "autobricks-web-test-"));
+  const configPath = path.join(directory, "server.ini");
+  fs.writeFileSync(configPath, SAMPLE);
+  const config = new ServerConfig(configPath);
+  try {
+    config.saveClient({ vpnAddress: "10.8.1.3", fingerprint: "b".repeat(64), loginId: "alice", password: "secret123" });
+    assert.deepEqual(config.listClients().at(-1), { vpnAddress: "10.8.1.3", fingerprint: "b".repeat(64), loginId: "alice", requiresLogin: true });
+    assert.match(fs.readFileSync(configPath, "utf8"), new RegExp(`${"b".repeat(64)} alice secret123`));
+    config.removeClient("10.8.1.2");
+    assert.match(fs.readFileSync(configPath, "utf8"), /alice secret123/);
+    assert.throws(() => config.saveClient({ vpnAddress: "10.8.1.4", fingerprint: "c".repeat(64), loginId: "bob" }), /함께/);
   } finally {
     fs.rmSync(directory, { recursive: true });
   }

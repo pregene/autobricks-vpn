@@ -1,17 +1,26 @@
 const webState = document.querySelector("#web-state");
 const vpnState = document.querySelector("#vpn-state");
 const vpnMessage = document.querySelector("#vpn-message");
-const startedAt = document.querySelector("#started-at");
+const activityList = document.querySelector("#activity-list");
 const refreshButton = document.querySelector("#refresh-button");
-const pkiRefreshButton = document.querySelector("#pki-refresh-button");
-const signerState = document.querySelector("#signer-state");
-const inventoryList = document.querySelector("#inventory-list");
-const serverCertificateForm = document.querySelector("#server-certificate-form");
-const clientCertificateForm = document.querySelector("#client-certificate-form");
-const clientBindingForm = document.querySelector("#client-binding-form");
-const clientList = document.querySelector("#client-list");
-const liveSessionList = document.querySelector("#live-session-list");
+const clientDialog = document.querySelector("#client-dialog");
+const openClientDialog = document.querySelector("#open-client-dialog");
+const closeClientDialog = document.querySelector("#close-client-dialog");
+const clientAddForm = document.querySelector("#client-add-form");
+const clientAddResult = document.querySelector("#client-add-result");
+const deleteClientDialog = document.querySelector("#delete-client-dialog");
+const deleteClientAddress = document.querySelector("#delete-client-address");
+const deleteClientResult = document.querySelector("#delete-client-result");
+const cancelDeleteClient = document.querySelector("#cancel-delete-client");
+const confirmDeleteClient = document.querySelector("#confirm-delete-client");
+const registeredClientList = document.querySelector("#registered-client-list");
 const liveSessionState = document.querySelector("#live-session-state");
+const serverAddress = document.querySelector("#server-vpn-address");
+const serverMtu = document.querySelector("#server-mtu");
+let registeredClients = [];
+let activeSessions = [];
+let vpnAvailable = false;
+let pendingDeleteAddress = null;
 
 function formatDate(value) {
   return new Intl.DateTimeFormat("ko-KR", {
@@ -26,98 +35,57 @@ function escapeHtml(value) {
   })[character]);
 }
 
-function renderInventory(data) {
-  const items = [
-    ...data.certificates.map((item) => ({
-      title: item.subject,
-      detail: item.subjectAltName || item.fingerprint,
-      meta: `서버 인증서 · ${formatDate(item.validTo)} 만료`,
-      status: "등록됨",
-    })),
-    ...data.requests.map((item) => ({
-      title: item.name,
-      detail: item.vpnAddress,
-      meta: `클라이언트 발급 요청 · ${item.validityDays}일`,
-      status: "서명 대기",
-    })),
-  ];
-  inventoryList.innerHTML = items.length ? items.map((item) => `
-    <div class="inventory-item">
-      <div><strong>${escapeHtml(item.title)}</strong><small>${escapeHtml(item.detail)}</small></div>
-      <div><span>${escapeHtml(item.meta)}</span><b>${escapeHtml(item.status)}</b></div>
-    </div>`).join("") : '<p class="empty-state">등록된 인증서와 발급 요청이 없습니다.</p>';
+function renderRegisteredClients() {
+  const sessionsByAddress = new Map(activeSessions.map((session) => [session.vpnAddress, session]));
+  liveSessionState.textContent = `${registeredClients.length}개 등록 · ${vpnAvailable ? `${activeSessions.length}개 연결` : "연결 상태 확인 불가"}`;
+  registeredClientList.innerHTML = registeredClients.length ? registeredClients.map((client) => {
+    const session = sessionsByAddress.get(client.vpnAddress);
+    const status = !vpnAvailable ? "확인 불가" : session ? "연결됨" : "연결 안 됨";
+    return `<tr><td>${escapeHtml(client.vpnAddress)}</td><td class="fingerprint">${escapeHtml(client.fingerprint)}</td><td>${escapeHtml(session?.clientIp || "-")}</td><td class="${session ? "connected" : ""}">${status}</td><td><button class="danger-action" type="button" data-delete-client="${escapeHtml(client.vpnAddress)}">삭제</button></td></tr>`;
+  }).join("") : '<tr><td colspan="5">등록된 클라이언트가 없습니다.</td></tr>';
 }
 
-function renderLiveSessions(sessions) {
-  liveSessionState.textContent = `${sessions.length}개 연결됨`;
-  vpnState.textContent = "실시간 연결됨";
-  vpnMessage.textContent = "Rust VPN 서버 이벤트 스트림 수신 중";
-  liveSessionList.innerHTML = sessions.length ? sessions.map((session) => `
-    <div class="inventory-item live-session-item">
-      <div><strong>${escapeHtml(session.vpnAddress)}</strong><small>${escapeHtml(session.fingerprint)}</small></div>
-      <div class="session-counters"><span>RX ${Number(session.bytesRx).toLocaleString()} B · TX ${Number(session.bytesTx).toLocaleString()} B</span><small>${Number(session.connectedSeconds).toLocaleString()}초 연결</small></div>
-      <button class="danger-action" type="button" data-disconnect-session="${escapeHtml(session.vpnAddress)}">연결 끊기</button>
-    </div>`).join("") : '<p class="empty-state">현재 연결된 VPN 클라이언트가 없습니다.</p>';
+function renderActivity(entries) {
+  const labels = {
+    server_started: "VPN 서버 시작",
+    server_stopped: "VPN 서버 종료",
+    client_connected: "클라이언트 접속",
+    client_disconnected: "클라이언트 해지",
+  };
+  activityList.innerHTML = entries.length ? entries.map((entry) => {
+    const details = [entry.vpnAddress, entry.clientIp].filter(Boolean).join(" · ");
+    return `<li><span class="activity-icon ${entry.type === "server_started" || entry.type === "client_connected" ? "success" : "neutral"}"></span><div><strong>${escapeHtml(labels[entry.type] ?? entry.type)}${details ? ` · ${escapeHtml(details)}` : ""}</strong><small>${escapeHtml(formatDate(entry.occurredAt))}</small></div></li>`;
+  }).join("") : '<li class="empty-state">기록된 이벤트가 없습니다.</li>';
 }
+
+async function refreshActivity() {
+  try {
+    const response = await fetch("/api/activity", { cache: "no-store" });
+    if (!response.ok) throw new Error(`status ${response.status}`);
+    renderActivity((await response.json()).entries);
+  } catch (error) {
+    activityList.innerHTML = '<li class="empty-state">이벤트를 읽을 수 없습니다.</li>';
+    console.error("Unable to refresh activity", error);
+  }
+}
+
+const activityEvents = new EventSource("/api/activity/events");
+activityEvents.addEventListener("activity", (event) => renderActivity(JSON.parse(event.data).entries));
 
 const sessionEvents = new EventSource("/api/vpn/events");
-sessionEvents.addEventListener("sessions", (event) => renderLiveSessions(JSON.parse(event.data).sessions));
-sessionEvents.addEventListener("unavailable", () => {
-  liveSessionState.textContent = "VPN 서버 연결 안 됨";
-  vpnState.textContent = "오프라인";
+sessionEvents.addEventListener("sessions", (event) => {
+  activeSessions = JSON.parse(event.data).sessions;
+  vpnAvailable = true;
+  renderRegisteredClients();
 });
-sessionEvents.onerror = () => { liveSessionState.textContent = "다시 연결 중"; };
-
-async function refreshPki() {
-  pkiRefreshButton.disabled = true;
-  try {
-    const [pkiResponse, clientsResponse] = await Promise.all([
-      fetch("/api/pki", { cache: "no-store" }),
-      fetch("/api/clients", { cache: "no-store" }),
-    ]);
-    if (!pkiResponse.ok || !clientsResponse.ok) throw new Error("PKI API response failed");
-    const data = await pkiResponse.json();
-    const clientData = await clientsResponse.json();
-    signerState.textContent = data.capabilities.signer === "not_configured" ? "CA 서명 서비스 연결 대기" : "CA 서명 서비스 연결됨";
-    renderInventory(data);
-    clientList.innerHTML = clientData.clients.length ? clientData.clients.map((client) => `
-      <div class="inventory-item">
-        <div><strong>${escapeHtml(client.vpnAddress)}</strong><small>${escapeHtml(client.fingerprint)}</small></div>
-        <button class="danger-action" type="button" data-remove-client="${escapeHtml(client.vpnAddress)}">등록 해제</button>
-      </div>`).join("") : '<p class="empty-state">등록된 VPN 클라이언트가 없습니다.</p>';
-  } catch (error) {
-    signerState.textContent = "PKI 상태 확인 실패";
-    console.error("Unable to refresh PKI status", error);
-  } finally {
-    pkiRefreshButton.disabled = false;
-  }
-}
-
-async function submitForm(form, endpoint, options = {}) {
-  const result = form.querySelector(".form-result");
-  const button = form.querySelector("button[type=submit]");
-  result.textContent = "처리 중…";
-  result.className = "form-result";
-  button.disabled = true;
-  try {
-    const response = await fetch(endpoint, {
-      method: options.method ?? "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(Object.fromEntries(new FormData(form))),
-    });
-    const body = await response.json();
-    if (!response.ok) throw new Error(body.message || body.error);
-    result.textContent = options.success ?? (response.status === 201 ? "서버 인증서를 등록했습니다." : "발급 요청을 안전하게 접수했습니다.");
-    result.classList.add("success");
-    form.reset();
-    await refreshPki();
-  } catch (error) {
-    result.textContent = error.message;
-    result.classList.add("error");
-  } finally {
-    button.disabled = false;
-  }
-}
+sessionEvents.addEventListener("unavailable", () => {
+  vpnAvailable = false;
+  renderRegisteredClients();
+});
+sessionEvents.onerror = () => {
+  vpnAvailable = false;
+  renderRegisteredClients();
+};
 
 async function refreshStatus() {
   refreshButton.disabled = true;
@@ -127,9 +95,14 @@ async function refreshStatus() {
     const status = await response.json();
 
     webState.textContent = status.web.state === "online" ? "정상 운영 중" : status.web.state;
-    vpnState.textContent = status.vpn.state === "integration_pending" ? "연결 대기" : status.vpn.state;
+    vpnState.textContent = status.vpn.state === "online" ? "정상 운영 중" : "상태 확인 불가";
     vpnMessage.textContent = status.vpn.message;
-    startedAt.textContent = `${formatDate(status.web.startedAt)} 시작`;
+    serverAddress.textContent = status.server?.vpnAddress ?? "확인 불가";
+    serverMtu.textContent = status.server?.mtu ?? "확인 불가";
+    registeredClients = status.clients;
+    activeSessions = status.vpn.sessions;
+    vpnAvailable = status.vpn.state === "online";
+    renderRegisteredClients();
   } catch (error) {
     webState.textContent = "연결 오류";
     vpnState.textContent = "확인 불가";
@@ -140,36 +113,85 @@ async function refreshStatus() {
   }
 }
 
-refreshButton.addEventListener("click", refreshStatus);
-pkiRefreshButton.addEventListener("click", refreshPki);
-serverCertificateForm.addEventListener("submit", (event) => {
-  event.preventDefault();
-  submitForm(serverCertificateForm, "/api/pki/server-certificates");
+refreshButton.addEventListener("click", () => { refreshStatus(); refreshActivity(); });
+openClientDialog.addEventListener("click", () => {
+  clientAddResult.textContent = "";
+  clientDialog.showModal();
 });
-clientCertificateForm.addEventListener("submit", (event) => {
+closeClientDialog.addEventListener("click", () => clientDialog.close());
+clientAddForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  submitForm(clientCertificateForm, "/api/pki/client-certificates");
-});
-clientBindingForm.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const vpnAddress = new FormData(clientBindingForm).get("vpnAddress");
-  await submitForm(clientBindingForm, `/api/clients/${encodeURIComponent(vpnAddress)}`,
-    { method: "PUT", success: "클라이언트를 server.ini에 등록했습니다." });
-});
-clientList.addEventListener("click", async (event) => {
-  const button = event.target.closest("[data-remove-client]");
-  if (!button) return;
+  const button = clientAddForm.querySelector('button[type="submit"]');
+  const input = Object.fromEntries(new FormData(clientAddForm));
+  const vpnAddress = String(input.vpnAddress).trim();
+  if (registeredClients.some((client) => client.vpnAddress === vpnAddress)) {
+    clientAddResult.textContent = "이미 등록된 VPN 주소입니다.";
+    clientAddResult.className = "form-result error";
+    return;
+  }
   button.disabled = true;
-  const response = await fetch(`/api/clients/${encodeURIComponent(button.dataset.removeClient)}`, { method: "DELETE" });
-  if (response.ok) await refreshPki();
-  else button.disabled = false;
+  clientAddResult.textContent = "인증서 발급 중…";
+  clientAddResult.className = "form-result";
+  try {
+    const response = await fetch("/api/clients/issue", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: input.name, vpnAddress, validityDays: Number(input.validityDays), loginId: input.loginId, password: input.password }),
+    });
+    if (!response.ok) {
+      const body = await response.json();
+      throw new Error(body.message ?? body.error);
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const download = document.createElement("a");
+    download.href = url;
+    download.download = `${String(input.name).trim()}-client.ini`;
+    download.click();
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    clientAddForm.reset();
+    clientDialog.close();
+    await refreshStatus();
+  } catch (error) {
+    clientAddResult.textContent = error.message;
+    clientAddResult.classList.add("error");
+  } finally {
+    button.disabled = false;
+  }
 });
-liveSessionList.addEventListener("click", async (event) => {
-  const button = event.target.closest("[data-disconnect-session]");
+registeredClientList.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-delete-client]");
   if (!button) return;
-  button.disabled = true;
-  const response = await fetch(`/api/vpn/sessions/${encodeURIComponent(button.dataset.disconnectSession)}`, { method: "DELETE" });
-  if (!response.ok) button.disabled = false;
+  pendingDeleteAddress = button.dataset.deleteClient;
+  deleteClientAddress.textContent = pendingDeleteAddress;
+  deleteClientResult.textContent = "";
+  deleteClientResult.className = "form-result";
+  deleteClientDialog.showModal();
+});
+cancelDeleteClient.addEventListener("click", () => deleteClientDialog.close());
+deleteClientDialog.addEventListener("close", () => { pendingDeleteAddress = null; });
+confirmDeleteClient.addEventListener("click", async () => {
+  if (!pendingDeleteAddress) return;
+  const vpnAddress = pendingDeleteAddress;
+  confirmDeleteClient.disabled = true;
+  cancelDeleteClient.disabled = true;
+  deleteClientResult.textContent = "삭제 중…";
+  try {
+    const response = await fetch(`/api/clients/${encodeURIComponent(vpnAddress)}`, { method: "DELETE" });
+    if (!response.ok) {
+      const body = await response.json();
+      throw new Error(body.message ?? body.error);
+    }
+    await refreshStatus();
+    deleteClientDialog.close();
+  } catch (error) {
+    deleteClientResult.textContent = `삭제할 수 없습니다: ${error.message}`;
+    deleteClientResult.className = "form-result error";
+    await refreshStatus();
+  } finally {
+    confirmDeleteClient.disabled = false;
+    cancelDeleteClient.disabled = false;
+  }
 });
 refreshStatus();
-refreshPki();
+refreshActivity();

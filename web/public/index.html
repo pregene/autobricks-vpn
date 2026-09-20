@@ -6,7 +6,7 @@
     <meta name="description" content="Autobricks VPN 서버 운영 대시보드" />
     <title>Autobricks VPN Control</title>
     <link rel="stylesheet" href="/styles.css" />
-    <script src="/app.js" type="module"></script>
+    <script src="/app.js?v=client-issuance" type="module"></script>
   </head>
   <body>
     <div class="page-shell">
@@ -48,8 +48,8 @@
               <span>VPN SERVER</span>
               <span class="status-pill" id="vpn-state">연결 대기</span>
             </div>
-            <strong class="metric-value">10.8.1.1</strong>
-            <p id="vpn-message">서버 상태 provider를 연결하면 실시간 정보가 표시됩니다.</p>
+            <strong class="metric-value" id="server-vpn-address">확인 중</strong>
+            <p id="vpn-message">VPN 서버 상태 확인 중</p>
           </article>
 
           <article class="metric">
@@ -60,121 +60,69 @@
 
           <article class="metric">
             <div class="metric-heading"><span>TUNNEL MTU</span><span>INNER</span></div>
-            <strong class="metric-value">1350</strong>
+            <strong class="metric-value" id="server-mtu">확인 중</strong>
             <p>DTLS overhead와 분리된 내부 packet MTU</p>
           </article>
         </section>
 
-        <section class="panel live-sessions-panel" aria-labelledby="live-sessions-title">
+        <section class="panel live-sessions-panel" aria-labelledby="registered-clients-title">
           <div class="panel-heading">
-            <div><p class="eyebrow">LIVE SESSIONS</p><h2 id="live-sessions-title">현재 연결</h2></div>
-            <span class="panel-note" id="live-session-state">서버 연결 중</span>
+            <div><p class="eyebrow">CLIENTS</p><h2 id="registered-clients-title">클라이언트</h2><span class="panel-note" id="live-session-state">상태 확인 중</span></div>
+            <button id="open-client-dialog" type="button" aria-haspopup="dialog" aria-controls="client-dialog">추가</button>
           </div>
-          <div class="inventory-list" id="live-session-list">
-            <p class="empty-state">VPN 서버의 실시간 이벤트를 기다리고 있습니다.</p>
+          <div class="client-table-wrap">
+            <table class="client-status-table">
+              <thead><tr><th>VPN 주소</th><th>인증서 지문</th><th>클라이언트 IP</th><th>연결 상태</th><th>관리</th></tr></thead>
+              <tbody id="registered-client-list"><tr><td colspan="5">클라이언트 목록 확인 중</td></tr></tbody>
+            </table>
           </div>
         </section>
 
         <section class="workspace">
-          <article class="panel topology-panel">
-            <div class="panel-heading">
-              <div><p class="eyebrow">NETWORK MAP</p><h2>터널 토폴로지</h2></div>
-              <span class="panel-note">10.8.1.0/24</span>
-            </div>
-            <div class="topology" aria-label="서버와 클라이언트 연결 구조">
-              <div class="node client-node"><span>CLIENT A</span><strong>10.8.1.2</strong><small>macOS</small></div>
-              <div class="connection"><i></i><span>DTLS</span><i></i></div>
-              <div class="node server-node"><span>VPN SERVER</span><strong>10.8.1.1</strong><small>Linux</small></div>
-              <div class="connection"><i></i><span>DTLS</span><i></i></div>
-              <div class="node client-node"><span>CLIENT B</span><strong>10.8.1.3</strong><small>Linux</small></div>
-            </div>
-          </article>
-
           <article class="panel activity-panel">
             <div class="panel-heading">
-              <div><p class="eyebrow">ACTIVITY</p><h2>운영 상태</h2></div>
+              <div><p class="eyebrow">ACTIVITY</p><h2>최근 이벤트</h2></div>
               <button id="refresh-button" type="button">새로고침</button>
             </div>
             <ol class="activity-list" id="activity-list">
-              <li><span class="activity-icon success"></span><div><strong>웹 콘솔 시작</strong><small id="started-at">상태 확인 중</small></div></li>
-              <li><span class="activity-icon pending"></span><div><strong>VPN 상태 연동</strong><small>Rust status provider 연결 예정</small></div></li>
-              <li><span class="activity-icon neutral"></span><div><strong>관리 작업</strong><small>읽기 전용 API부터 단계적으로 활성화</small></div></li>
+              <li class="empty-state">이벤트를 불러오는 중입니다.</li>
             </ol>
           </article>
         </section>
 
-        <section class="pki-console" aria-labelledby="pki-title">
-          <div class="section-heading">
-            <div>
-              <p class="eyebrow">CERTIFICATE CONTROL</p>
-              <h2 id="pki-title">VPN 인증서 운영</h2>
+        <dialog class="client-dialog" id="client-dialog" aria-labelledby="client-dialog-title">
+          <form id="client-add-form">
+            <div class="client-dialog-heading">
+              <h2 id="client-dialog-title">클라이언트 추가</h2>
+              <button class="dialog-close" id="close-client-dialog" type="button" aria-label="클라이언트 추가 닫기">닫기</button>
             </div>
-            <span class="signer-state" id="signer-state">서명 서비스 확인 중</span>
+            <p>서버의 Intermediate CA로 클라이언트 인증서를 발급하고, 바로 사용할 수 있는 단일 client.ini를 다운로드합니다.</p>
+            <label><span>클라이언트 이름</span><input name="name" required maxlength="64" pattern="[a-zA-Z0-9][a-zA-Z0-9_.-]*" placeholder="예: macbook" autocomplete="off" /></label>
+            <label><span>VPN 주소</span><input name="vpnAddress" required placeholder="예: 10.9.1.4" autocomplete="off" /></label>
+            <label><span>로그인 ID (선택)</span><input name="loginId" maxlength="64" autocomplete="off" /></label>
+            <label><span>로그인 암호 (선택)</span><input name="password" type="password" maxlength="128" autocomplete="new-password" /></label>
+            <p>ID와 암호를 함께 입력하면 클라이언트 실행 시 로그인을 요구합니다. 다운로드하는 INI에는 저장되지 않습니다.</p>
+            <label><span>유효 기간 (일)</span><input name="validityDays" type="number" min="1" max="825" value="365" required /></label>
+            <output class="form-result" id="client-add-result" aria-live="polite"></output>
+            <button class="primary-action" type="submit">발급 및 다운로드</button>
+          </form>
+        </dialog>
+        <dialog class="client-dialog" id="delete-client-dialog" aria-labelledby="delete-client-title">
+          <div class="client-dialog-heading">
+            <h2 id="delete-client-title">클라이언트 삭제</h2>
           </div>
-
-          <div class="pki-grid">
-            <form class="panel operation-form" id="server-certificate-form">
-              <div class="operation-number">01</div>
-              <h3>서버 인증서 등록</h3>
-              <p>발급된 X.509 인증서를 검사하고 서버 개인키의 경로만 등록합니다. 개인키 내용은 웹으로 전송하지 않습니다.</p>
-              <label>
-                <span>서버 인증서 PEM</span>
-                <textarea name="certificatePem" rows="7" required placeholder="-----BEGIN CERTIFICATE-----"></textarea>
-              </label>
-              <label>
-                <span>개인키 서버 경로</span>
-                <input name="keyReference" required value="/etc/autobricks-vpn/server-key.pem" />
-              </label>
-              <button class="primary-action" type="submit">인증서 검사 및 등록</button>
-              <output class="form-result" aria-live="polite"></output>
-            </form>
-
-            <form class="panel operation-form" id="client-certificate-form">
-              <div class="operation-number">02</div>
-              <h3>클라이언트 인증서 발급</h3>
-              <p>클라이언트에서 생성한 CSR과 VPN IP를 접수합니다. CA 서명 서비스 연결 후 인증서와 지문 매핑을 발급합니다.</p>
-              <div class="field-row">
-                <label><span>클라이언트 이름</span><input name="name" required placeholder="paulcho-macbook" /></label>
-                <label><span>VPN IP</span><input name="vpnAddress" required placeholder="10.8.1.4" /></label>
-              </div>
-              <label>
-                <span>CSR PEM</span>
-                <textarea name="csrPem" rows="5" required placeholder="-----BEGIN CERTIFICATE REQUEST-----"></textarea>
-              </label>
-              <label><span>유효 기간</span><select name="validityDays"><option value="90">90일</option><option value="365" selected>365일</option><option value="730">730일</option></select></label>
-              <button class="primary-action" type="submit">발급 요청 생성</button>
-              <output class="form-result" aria-live="polite"></output>
-            </form>
-
-            <form class="panel operation-form" id="client-binding-form">
-              <div class="operation-number">03</div>
-              <h3>클라이언트 등록</h3>
-              <p>발급된 인증서의 SHA-256 지문을 VPN IP에 연결합니다. 저장 즉시 <code>server.ini</code>에 반영되고 서버의 주기적 reload로 적용됩니다.</p>
-              <label><span>VPN IP</span><input name="vpnAddress" required placeholder="10.8.1.4" /></label>
-              <label><span>인증서 SHA-256 지문</span><input name="fingerprint" required minlength="64" placeholder="64자리 SHA-256 fingerprint" /></label>
-              <button class="primary-action" type="submit">클라이언트 등록</button>
-              <output class="form-result" aria-live="polite"></output>
-            </form>
+          <p><strong id="delete-client-address"></strong> 클라이언트를 삭제하시겠습니까?</p>
+          <p>등록 정보를 제거하면 현재 연결도 즉시 끊어집니다.</p>
+          <output class="form-result" id="delete-client-result" aria-live="polite"></output>
+          <div class="dialog-actions">
+            <button class="dialog-close" id="cancel-delete-client" type="button">취소</button>
+            <button class="danger-action" id="confirm-delete-client" type="button">삭제</button>
           </div>
-
-          <article class="panel inventory-panel">
-            <div class="panel-heading">
-              <div><p class="eyebrow">INVENTORY</p><h2>인증서와 발급 요청</h2></div>
-              <button id="pki-refresh-button" type="button">목록 새로고침</button>
-            </div>
-            <div class="inventory-list" id="inventory-list">
-              <p class="empty-state">등록된 인증서와 발급 요청이 없습니다.</p>
-            </div>
-            <div class="client-list-heading"><h3>VPN 클라이언트</h3><span>server.ini [client]</span></div>
-            <div class="inventory-list" id="client-list">
-              <p class="empty-state">등록된 VPN 클라이언트가 없습니다.</p>
-            </div>
-          </article>
-        </section>
+        </dialog>
       </main>
 
       <footer>
-        <span>Autobricks VPN 1.0</span>
+        <span>Autobricks VPN</span>
         <span>Control surface · local only</span>
       </footer>
     </div>

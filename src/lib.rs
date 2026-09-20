@@ -54,6 +54,30 @@ pub extern "C" fn autobricks_vpn_client_run(config_path: *const c_char) -> c_int
     run_from_ffi(config_path, client::run)
 }
 
+/// Run the VPN client with login credentials supplied by the launcher.
+///
+/// # Safety
+/// All pointers must reference valid, NUL-terminated strings for this call.
+#[no_mangle]
+pub unsafe extern "C" fn autobricks_vpn_client_run_with_login(
+    config_path: *const c_char,
+    user: *const c_char,
+    password: *const c_char,
+) -> c_int {
+    if user.is_null() || password.is_null() {
+        eprintln!("autobricks-vpn: login ID and password are required together");
+        return 2;
+    }
+    let (user, password) = unsafe { (CStr::from_ptr(user), CStr::from_ptr(password)) };
+    let (Ok(user), Ok(password)) = (user.to_str(), password.to_str()) else {
+        eprintln!("autobricks-vpn: login ID and password must be UTF-8");
+        return 2;
+    };
+    run_from_ffi(config_path, |path| {
+        client::run_with_login(path, Some((user, password)))
+    })
+}
+
 /// Run the VPN server with the required configuration path.
 #[no_mangle]
 pub extern "C" fn autobricks_vpn_server_run(config_path: *const c_char) -> c_int {
@@ -131,6 +155,10 @@ pub enum DtlsIoResult {
 /// Encrypted application-data marker used to keep a DTLS session and its UDP/NAT mapping alive.
 /// Valid tunneled packets start with an IPv4 or IPv6 version nibble, so this cannot be a TUN packet.
 pub const KEEPALIVE_PACKET: &[u8] = &[0];
+pub const AUTH_REQUIRED: &[u8] = b"\xffAVPN_AUTH_REQUIRED";
+pub const AUTH_OK: &[u8] = b"\xffAVPN_AUTH_OK";
+pub const AUTH_FAILED: &[u8] = b"\xffAVPN_AUTH_FAILED";
+pub const AUTH_LOGIN_PREFIX: &[u8] = b"\xffAVPN_AUTH_LOGIN\0";
 pub const MIN_TUN_MTU: u16 = 576;
 pub const MAX_TUN_MTU: u16 = 1500;
 
@@ -2048,7 +2076,8 @@ pub fn validate_client_bindings(
                 format!("duplicate client address: {address}"),
             ));
         }
-        let fingerprint = normalize_sha256_fingerprint(&fingerprint).map_err(|error| {
+        let fingerprint = fingerprint.split_whitespace().next().unwrap_or("");
+        let fingerprint = normalize_sha256_fingerprint(fingerprint).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("invalid fingerprint for {address}: {error}"),

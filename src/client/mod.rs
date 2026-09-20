@@ -8,7 +8,8 @@ mod udp_write;
 
 use autobricks_vpn::{
     base::worker::WorkerSignal, ipv4_socket_addr_size, panic_gate, parse_ini_section,
-    socket_addr_storage, Config, DnsGuard, Dtls, DtlsIo, SynchronizedDtls, Tun, KEEPALIVE_PACKET,
+    socket_addr_storage, Config, DnsGuard, Dtls, DtlsIo, SynchronizedDtls, Tun, AUTH_FAILED,
+    AUTH_LOGIN_PREFIX, AUTH_OK, AUTH_REQUIRED, KEEPALIVE_PACKET,
 };
 use std::collections::HashMap;
 use std::io;
@@ -17,12 +18,137 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use udp_read::wait_for_udp;
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
+
+struct LoginCredentials {
+    id: Vec<u8>,
+    password: Vec<u8>,
+}
+
+fn make_login_credentials(id: &str, password: &str) -> io::Result<LoginCredentials> {
+    if id.is_empty()
+        || id.len() > 128
+        || id.contains('\0')
+        || password.is_empty()
+        || password.len() > 128
+        || password.contains('\0')
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid login input",
+        ));
+    }
+    Ok(LoginCredentials {
+        id: id.as_bytes().to_vec(),
+        password: password.as_bytes().to_vec(),
+    })
+}
+
+impl Drop for LoginCredentials {
+    fn drop(&mut self) {
+        self.id.fill(0);
+        self.password.fill(0);
+    }
+}
+
+pub(crate) struct EmbeddedCredentials(PathBuf);
+
+impl Drop for EmbeddedCredentials {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn embedded_section(text: &str, section: &str) -> io::Result<String> {
+    let header = format!("[{section}]");
+    let lines: Vec<_> = text.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| line.trim() == header)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("missing [{section}]"))
+        })?;
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, line)| line.trim().starts_with('[') && line.trim().ends_with(']'))
+        .map_or(lines.len(), |(index, _)| index);
+    let pem = lines[start + 1..end].join("\n");
+    if !pem.contains("-----BEGIN ") || !pem.contains("-----END ") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid [{section}] PEM"),
+        ));
+    }
+    Ok(format!("{}\n", pem.trim()))
+}
+
+pub(crate) fn materialize_embedded_credentials(
+    path: &str,
+    values: &mut HashMap<String, String>,
+) -> io::Result<Option<EmbeddedCredentials>> {
+    let text = std::fs::read_to_string(path)?;
+    let has_embedded = text.lines().any(|line| line.trim() == "[certificate]");
+    if !has_embedded {
+        if ["certificate_file", "private_key_file", "ca_file"]
+            .iter()
+            .any(|field| values.get(*field).map(String::as_str) == Some("embedded"))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "missing [certificate]",
+            ));
+        }
+        return Ok(None);
+    }
+    let certificate = embedded_section(&text, "certificate")?;
+    let key = embedded_section(&text, "key")?;
+    let ca = embedded_section(&text, "ca")?;
+    let directory = std::env::temp_dir().join(format!(
+        "autobricks-client-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&directory)?;
+    let guard = EmbeddedCredentials(directory.clone());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+    }
+    for (name, pem) in [("certificate", certificate), ("key", key), ("ca", ca)] {
+        let destination = directory.join(format!("{name}.pem"));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        use std::io::Write;
+        options.open(&destination)?.write_all(pem.as_bytes())?;
+        let field = match name {
+            "certificate" => "certificate_file",
+            "key" => "private_key_file",
+            _ => "ca_file",
+        };
+        values.insert(
+            field.to_string(),
+            destination.to_string_lossy().into_owned(),
+        );
+    }
+    Ok(Some(guard))
+}
 const SERVER_LIVENESS_TIMEOUT: Duration = Duration::from_secs(23);
 const HEALTH_PROBE_INTERVAL: Duration = Duration::from_secs(20);
 const HEALTH_PROBE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -138,11 +264,140 @@ fn boolean_value(values: &HashMap<String, String>, key: &str, default: bool) -> 
     }
 }
 
+fn read_login_field(prompt: &str, hidden: bool) -> io::Result<String> {
+    use std::io::Write;
+    eprint!("{prompt}");
+    io::stderr().flush()?;
+    #[cfg(unix)]
+    let terminal = if hidden {
+        unsafe {
+            let mut original = std::mem::zeroed::<libc::termios>();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut original) == 0 {
+                let mut quiet = original;
+                quiet.c_lflag &= !libc::ECHO;
+                if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &quiet) == 0 {
+                    Some(original)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut input = String::new();
+    let result = io::stdin().read_line(&mut input);
+    #[cfg(unix)]
+    if let Some(original) = terminal {
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &original);
+        }
+        eprintln!();
+    }
+    if result? == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "login input ended",
+        ));
+    }
+    Ok(input.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn read_auth_response(
+    socket: &std::net::UdpSocket,
+    dtls: &mut Dtls,
+    timeout: Duration,
+) -> io::Result<Vec<u8>> {
+    let deadline = Instant::now() + timeout;
+    let mut frame = [0u8; 512];
+    loop {
+        match dtls.read(&mut frame) {
+            Ok(count) if count > 0 => return Ok(frame[..count].to_vec()),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "login response timed out",
+            ));
+        }
+        wait_for_udp(socket, remaining.min(Duration::from_secs(1)))?;
+    }
+}
+
+fn cached_login(
+    cache: &mut Option<LoginCredentials>,
+    mut prompt: impl FnMut(&str, bool) -> io::Result<String>,
+) -> io::Result<&LoginCredentials> {
+    if cache.is_none() {
+        let id = prompt("Login ID: ", false)?;
+        let password = prompt("Password: ", true)?;
+        *cache = Some(make_login_credentials(&id, &password)?);
+    }
+    Ok(cache.as_ref().expect("login credentials cached"))
+}
+
+fn authenticate(
+    socket: &std::net::UdpSocket,
+    dtls: &mut Dtls,
+    login_cache: &mut Option<LoginCredentials>,
+) -> io::Result<()> {
+    let response = read_auth_response(socket, dtls, Duration::from_secs(10))?;
+    if response == AUTH_OK {
+        return Ok(());
+    }
+    if response != AUTH_REQUIRED {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "invalid login challenge",
+        ));
+    }
+    let credentials = cached_login(login_cache, read_login_field)?;
+    let mut frame = AUTH_LOGIN_PREFIX.to_vec();
+    frame.extend_from_slice(&credentials.id);
+    frame.push(0);
+    frame.extend_from_slice(&credentials.password);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match dtls.write(&frame) {
+            Ok(written) if written == frame.len() => break,
+            Ok(_) => return Err(io::Error::other("partial login message")),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "login send timed out",
+                    ));
+                }
+                wait_for_udp(socket, Duration::from_millis(100))?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    match read_auth_response(socket, dtls, Duration::from_secs(10))?.as_slice() {
+        value if value == AUTH_OK => Ok(()),
+        value if value == AUTH_FAILED => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "login failed",
+        )),
+        _ => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "invalid login response",
+        )),
+    }
+}
+
 fn connect(
     server: Ipv4Addr,
     port: u16,
     config: &Config,
     verify_server_san_ip: bool,
+    login_cache: &mut Option<LoginCredentials>,
 ) -> io::Result<(std::net::UdpSocket, Dtls)> {
     let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
     socket.connect(SocketAddr::from((server, port)))?;
@@ -191,6 +446,7 @@ fn connect(
         ));
     }
     eprintln!("[client] DTLS handshake complete");
+    authenticate(&socket, &mut dtls, login_cache)?;
     Ok((socket, dtls))
 }
 
@@ -201,8 +457,9 @@ fn run_connection(
     tun: &Arc<Tun>,
     keepalive_interval: Duration,
     verify_server_san_ip: bool,
+    login_cache: &mut Option<LoginCredentials>,
 ) -> io::Result<()> {
-    let (socket, mut dtls) = connect(server, port, config, verify_server_san_ip)?;
+    let (socket, mut dtls) = connect(server, port, config, verify_server_san_ip, login_cache)?;
     let queues = queues::ClientQueues::new()?;
     let encrypted_queue = Arc::clone(&queues.encrypted_rx);
     let plain_queue = Arc::clone(&queues.raw_tx);
@@ -375,10 +632,15 @@ fn run_connection(
 }
 
 pub(crate) fn run(path: &str) -> io::Result<()> {
+    run_with_login(path, None)
+}
+
+pub(crate) fn run_with_login(path: &str, supplied_login: Option<(&str, &str)>) -> io::Result<()> {
     RUNNING.store(true, Ordering::Relaxed);
     install_signal_handlers()?;
     eprintln!("[client] loading config: {path}");
-    let values = parse_ini_section(path, "client")?;
+    let mut values = parse_ini_section(path, "client")?;
+    let _embedded_credentials = materialize_embedded_credentials(path, &mut values)?;
     eprintln!("[client] config loaded");
     let server: Ipv4Addr = value(&values, "server_address", "127.0.0.1")
         .parse()
@@ -419,9 +681,18 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
             .map_err(|_| io::Error::other("invalid mtu"))?,
     };
     let skip_tun = std::env::var_os("AVPN_SKIP_TUN").is_some();
+    let mut login_cache = supplied_login
+        .map(|(id, password)| make_login_credentials(id, password))
+        .transpose()?;
     if skip_tun {
         eprintln!("[client] TUN skipped because AVPN_SKIP_TUN is set");
-        let _connection = connect(server, port, &config, verify_server_san_ip)?;
+        let _connection = connect(
+            server,
+            port,
+            &config,
+            verify_server_san_ip,
+            &mut login_cache,
+        )?;
         println!("DTLS handshake test succeeded");
         return Ok(());
     }
@@ -451,11 +722,15 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
                 &tun,
                 keepalive_interval,
                 verify_server_san_ip,
+                &mut login_cache,
             )
         }) {
             Ok(()) => return Ok(()),
             Err(error) => error,
         };
+        if error.kind() == io::ErrorKind::PermissionDenied {
+            return Err(error);
+        }
         let delay = reconnect_delay(&error);
         if delay.is_zero() {
             eprintln!("[client] connection lost: {error}; reconnecting immediately");
@@ -472,7 +747,12 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_keepalive_interval, reconnect_delay};
+    use super::{
+        cached_login, effective_keepalive_interval, materialize_embedded_credentials,
+        reconnect_delay,
+    };
+    use crate::{parse_ini_section, Config, Dtls};
+    use std::collections::HashMap;
     use std::io;
     use std::time::Duration;
 
@@ -494,5 +774,74 @@ mod tests {
         let failure = io::Error::other("handshake failed");
         assert_eq!(reconnect_delay(&timeout), Duration::ZERO);
         assert_eq!(reconnect_delay(&failure), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn login_credentials_are_prompted_once_across_reconnections() {
+        let mut cache = None;
+        let mut prompts = 0;
+        for _ in 0..2 {
+            let credentials = cached_login(&mut cache, |_, hidden| {
+                prompts += 1;
+                Ok(if hidden { "secret" } else { "alice" }.to_string())
+            })
+            .unwrap();
+            assert_eq!(credentials.id, b"alice");
+            assert_eq!(credentials.password, b"secret");
+        }
+        assert_eq!(prompts, 2);
+    }
+
+    #[test]
+    fn embedded_credentials_become_private_temporary_files() {
+        let path = std::env::temp_dir().join(format!("autobricks-test-{}.ini", std::process::id()));
+        std::fs::write(&path, "[client]\ncertificate_file = certs/client-cert.pem\nprivate_key_file = certs/client-key.pem\nca_file = certs/trust-chain.pem\n\n[certificate]\n-----BEGIN CERTIFICATE-----\na\n-----END CERTIFICATE-----\n[key]\n-----BEGIN PRIVATE KEY-----\nb\n-----END PRIVATE KEY-----\n[ca]\n-----BEGIN CERTIFICATE-----\nc\n-----END CERTIFICATE-----\n").unwrap();
+        let mut values = HashMap::from([
+            (
+                "certificate_file".to_string(),
+                "certs/client-cert.pem".to_string(),
+            ),
+            (
+                "private_key_file".to_string(),
+                "certs/client-key.pem".to_string(),
+            ),
+            ("ca_file".to_string(), "certs/trust-chain.pem".to_string()),
+        ]);
+        let guard = materialize_embedded_credentials(path.to_str().unwrap(), &mut values)
+            .unwrap()
+            .unwrap();
+        assert!(std::fs::read_to_string(&values["private_key_file"])
+            .unwrap()
+            .contains("PRIVATE KEY"));
+        assert!(std::fs::read_to_string(&values["ca_file"])
+            .unwrap()
+            .contains("CERTIFICATE"));
+        assert_ne!(values["certificate_file"], "certs/client-cert.pem");
+        let directory = guard.0.clone();
+        drop(guard);
+        assert!(!directory.exists());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn configured_embedded_client_credentials_initialize_dtls() {
+        let Ok(path) = std::env::var("AVPN_TEST_CLIENT_CONFIG") else {
+            return;
+        };
+        let mut values = parse_ini_section(&path, "client").unwrap();
+        let _credentials = materialize_embedded_credentials(&path, &mut values)
+            .unwrap()
+            .unwrap();
+        let config = Config {
+            server: false,
+            certificate_file: values["certificate_file"].clone(),
+            private_key_file: values["private_key_file"].clone(),
+            ca_file: Some(values["ca_file"].clone()),
+            crl_file: None,
+            ocsp_enabled: false,
+            ocsp_url: None,
+            mtu: 1350,
+        };
+        Dtls::new(&config).unwrap();
     }
 }

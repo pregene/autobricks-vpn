@@ -120,7 +120,7 @@ pub(super) fn spawn(
                         || (multicast && routing.allow_multicast)
                     {
                         for session in list.iter_mut() {
-                            if session.established {
+                            if session.authenticated {
                                 queue_session_plain(session, packet.clone());
                             }
                         }
@@ -130,7 +130,7 @@ pub(super) fn spawn(
                             .iter()
                             .enumerate()
                             .filter(|(_, session)| {
-                                session.established && session.address == destination
+                                session.authenticated && session.address == destination
                             })
                             .max_by_key(|(_, session)| session.last_activity)
                             .map(|(index, _)| index)

@@ -1,4 +1,5 @@
 import { X509Certificate, randomUUID } from "node:crypto";
+import { validateClientAddress } from "./server-config.js";
 
 export class PkiError extends Error {
   constructor(status, code, message) {
@@ -22,19 +23,22 @@ function normalizeFingerprint(value) {
   return value.replaceAll(":", "").toLowerCase();
 }
 
-function validateVpnAddress(value) {
+function validateVpnAddress(value, settings) {
   const address = requiredText(value, "vpnAddress", 15);
-  const match = /^10\.8\.1\.(\d{1,3})$/.exec(address);
-  const host = match ? Number(match[1]) : -1;
-  if (host < 2 || host > 254) {
-    throw new PkiError(400, "invalid_vpn_address", "vpnAddress must be a client address in 10.8.1.2-10.8.1.254.");
+  try {
+    return validateClientAddress(address, settings);
+  } catch (error) {
+    throw new PkiError(400, "invalid_vpn_address", error.message);
   }
-  return address;
 }
 
 export class PkiService {
   #certificates = [];
   #requests = [];
+
+  constructor(settings = { vpnNetwork: "10.8.1.0/24", vpnAddress: "10.8.1.1" }) {
+    this.settings = settings;
+  }
 
   capabilities() {
     return {
@@ -90,7 +94,7 @@ export class PkiService {
 
   requestClientCertificate(input = {}) {
     const name = requiredText(input.name, "name", 128);
-    const vpnAddress = validateVpnAddress(input.vpnAddress);
+    const vpnAddress = validateVpnAddress(input.vpnAddress, this.settings);
     const csrPem = requiredText(input.csrPem, "csrPem", 32768);
     const validityDays = Number(input.validityDays);
 

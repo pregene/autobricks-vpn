@@ -3,7 +3,7 @@
 wolfSSL 기반 DTLS 1.3 VPN transport shared library와 서버/클라이언트 예제입니다.
 
 ```text
-Autobricks VPN 1.0
+Autobricks VPN 0.8.106
 Copyright © 2026 Autobricks.co.kr. All rights reserved.
 ```
 
@@ -18,10 +18,11 @@ Copyright © 2026 Autobricks.co.kr. All rights reserved.
 | TUN 설정 | OS별 TUN 생성, IPv4 주소·MTU·VPN 대역 route 자동 설정 |
 | 상호 인증 | CA 기반 서버/클라이언트 인증서 검증 |
 | 클라이언트 할당 | 인증서 SHA-256 fingerprint별 고정 VPN IP |
+| 선택적 로그인 | 등록 항목에 ID·암호가 있으면 DTLS 인증 후 로그인까지 확인; 없으면 인증서만 확인 |
 | SAN 검증 | 서버 SAN IP 검증, 선택적인 클라이언트 SAN IP 검증 |
 | 인증서 폐기 | CRL 및 OCSP(AIA URL 또는 override URL), 실패 시 연결 거부 |
 | 세션 관리 | keepalive, idle timeout, 최대 세션 수명, 고정 3초 재연결, 재인증 |
-| 설정 갱신 | 서버 인증서·키·CA와 client fingerprint binding 주기적 reload |
+| 설정 갱신 | 서버의 client binding 주기적 reload 및 웹의 즉시 RELOAD 요청 |
 | 공격 방어 | stateless DTLS cookie, pending handshake 제한, 출발지 IP spoofing 방지, panic 격리 |
 | 접속 제한 | 외부 IP별 1분 30회 handshake 시도 시 10분간 메모리 ban |
 | 전달 정책 | 설정에 따른 IPv4 broadcast/multicast 허용 또는 폐기 |
@@ -82,7 +83,7 @@ flowchart LR
     end
 ```
 
-각 세션은 peer 주소, 할당된 VPN IP, 인증서 fingerprint, `SynchronizedDtls`, 평문 `raw_tx_queue`와 암호문 `enc_tx_queue`를 보유합니다. Session Control worker는 세션 만료·DTLS 재전송·설정 및 인증서 재로드를 처리하고 Unix control socket의 `WATCH`·`DISCONNECT` 명령을 받습니다. Express 운영 화면은 이 소켓의 상태 변경을 SSE로 전달합니다.
+각 세션은 peer 주소, 할당된 VPN IP, 인증서 fingerprint, `SynchronizedDtls`, 평문 `raw_tx_queue`와 암호문 `enc_tx_queue`를 보유합니다. Session Control worker는 세션 만료·DTLS 재전송·설정 및 인증서 재로드를 처리하고 Unix control socket의 `WATCH`·`DISCONNECT`·`RELOAD` 명령을 받습니다. Express 운영 화면은 이 소켓의 상태 변경을 SSE로 전달합니다.
 
 ```mermaid
 flowchart LR
@@ -285,9 +286,10 @@ Windows TUN adapter는 `wintun` crate로 생성하며 관리자 권한이 필요
 ```c
 int autobricks_vpn_server_run(const char *config_path);
 int autobricks_vpn_client_run(const char *config_path);
+int autobricks_vpn_client_run_with_login(const char *config_path, const char *user, const char *password);
 ```
 
-설정 파일 경로는 필수이며 launcher의 `-c` 또는 `--config` 옵션으로 전달합니다. `--config=/path/to/config.ini` 형식도 지원하며 `-h` 또는 `--help`로 사용법을 확인할 수 있습니다. C API에서도 `config_path`가 `NULL`, 빈 문자열 또는 올바른 UTF-8 경로가 아니면 상태 `2`로 거부합니다. 정상 종료는 `0`, 설정 또는 실행 오류는 `1`, 격리된 panic은 `3`, 지원하지 않는 운영체제의 서버 호출은 `4`를 반환합니다.
+서버 설정 파일 경로는 필수이며 launcher의 `-c` 또는 `--config` 옵션으로 전달합니다. 클라이언트는 `--config`를 생략하면 작업 디렉터리의 `config/client.ini`를 사용합니다. 클라이언트 로그인 정보는 `--user <ID> --pass <PASSWORD>`로 함께 전달할 수 있으며, 생략하면 서버가 로그인을 요구할 때 터미널에서 입력받습니다. 입력한 정보는 실행 중 메모리에 보관해 재접속에 사용합니다. 명령행 암호는 셸 기록과 프로세스 인자에 남을 수 있으므로 노출을 피하려면 터미널 입력을 사용합니다. `--config=/path/to/config.ini` 형식과 `-h` 또는 `--help`도 지원합니다. C API에서도 `config_path`가 `NULL`, 빈 문자열 또는 올바른 UTF-8 경로가 아니면 상태 `2`로 거부합니다. 정상 종료는 `0`, 설정 또는 실행 오류는 `1`, 격리된 panic은 `3`, 지원하지 않는 운영체제의 서버 호출은 `4`를 반환합니다.
 
 `vpn-server`와 `vpn-client` 실행 파일에는 VPN 구현이 들어 있지 않습니다. Linux/macOS에서는 `dlopen`/`dlsym`, Windows에서는 `LoadLibraryW`/`GetProcAddress`로 동적 라이브러리를 열고 위 API를 호출하는 launcher입니다. 따라서 실행하려면 해당 운영체제용 autobricks-vpn 동적 라이브러리가 반드시 필요합니다. wolfSSL은 동적 라이브러리 내부에서 Rust FFI로 호출합니다.
 
@@ -301,7 +303,7 @@ DTLS 쓰기가 `WouldBlock`이면 아직 전송되지 않은 내부 패킷을 �
 
 활성 세션은 트래픽 유무와 관계없이 `max_session_lifetime` 이후 제거되며 기본값은 3600초, 허용 범위는 60~604800초입니다. 클라이언트가 다시 연결할 때 전체 certificate 인증과 새 key 협상을 수행하므로 장기 세션의 인증 상태가 무기한 유지되지 않습니다.
 
-서버는 `config_reload_interval`마다 설정 파일의 `[client]` fingerprint 매핑을 다시 읽습니다. 기본값은 30초이고 허용 범위는 5~3600초입니다. 삭제되거나 변경된 binding의 활성 세션은 즉시 제거하며, 새 DTLS acceptor도 다시 만들어 갱신된 서버 인증서·개인키·CA 파일을 이후 handshake에 반영합니다. reload 검증이 실패하면 기존 정상 설정과 세션을 유지합니다.
+서버는 `config_reload_interval`마다 설정 파일의 `[client]` fingerprint 및 선택적 로그인 정보를 다시 읽습니다. 기본값은 30초이고 허용 범위는 5~3600초입니다. 웹에서 추가·삭제하면 `RELOAD` 제어 명령으로 즉시 반영합니다. 삭제되거나 변경된 binding 및 로그인 정보의 활성 세션은 제거하며, 새 DTLS acceptor도 다시 만듭니다. reload 검증이 실패하면 기존 정상 설정과 세션을 유지합니다. 별도 종료 메시지 없이 종료한 클라이언트는 서버에서 마지막 활동 후 300초에 연결 해제로 처리합니다. 클라이언트 쪽 23초는 서버 응답을 기다리는 시간입니다.
 
 ## Push 전 검사
 
@@ -334,7 +336,7 @@ Ubuntu 서버가 `10.10.254.1`에서 실행 중이면 macOS client 설정의 `se
 
 디버깅 시 client 로그의 `[client] sending ClientHello` 다음에 `[client] DTLS handshake complete`가 표시되는지 확인합니다. handshake가 완료되지 않으면 서버/클라이언트가 같은 UDP port에 연결되어 있는지와 host firewall을 확인합니다. 정상 운용 시에는 packet별 로그를 출력하지 않습니다.
 
-서버와 클라이언트 설정은 각각 `server.ini`, `client.ini`의 `[server]`, `[client]` 섹션에서 관리합니다. VPN 바이너리에서는 `ca_file`이 필수이며 누락되거나 빈 값이면 시작을 거부합니다. 서버의 `ca_file`은 클라이언트 인증서를 검증하는 `trust-chain.pem`을 가리키며 PEM 형식의 Intermediate CA와 Root CA 인증서를 함께 담을 수 있습니다. 현재 개발 인증서는 Root CA가 직접 서명하므로 `trust-chain.pem`에는 Root CA 한 장만 들어 있습니다. 서버는 client certificate chain을, 클라이언트는 server certificate chain을 해당 CA로 검증합니다. 서버와 클라이언트는 시작 시 TUN IPv4 주소와 VPN 대역 route를 자동 설정합니다. macOS의 `ifconfig`/`route`, Linux의 `ip` 명령을 사용하므로 root 권한이 필요할 수 있습니다.
+서버와 클라이언트 설정은 각각 `server.ini`, `client.ini`의 `[server]`, `[client]` 섹션에서 관리합니다. `[certificate]`, `[key]`, `[ca]` PEM 섹션을 같은 INI에 넣으면 파일 경로 설정보다 우선합니다. 단일 INI에 개인키가 포함되므로 소유자 전용 파일 권한을 사용합니다. 서버의 `[ca]`는 클라이언트 인증서 검증용 Intermediate CA와 Root CA 체인을 담습니다. 서버는 client certificate chain을, 클라이언트는 server certificate chain을 해당 CA로 검증합니다. 서버와 클라이언트는 시작 시 TUN IPv4 주소와 VPN 대역 route를 자동 설정합니다. macOS의 `ifconfig`/`route`, Linux의 `ip` 명령을 사용하므로 root 권한이 필요할 수 있습니다.
 
 ### 서버 trust chain
 
@@ -358,13 +360,13 @@ Root CA certificate
 -----END CERTIFICATE-----
 ```
 
-현재 저장소의 개발용 인증서는 `certs/ca-cert.pem` Root CA가 Leaf 인증서를 직접 서명하므로 `certs/trust-chain.pem`에는 해당 Root CA만 들어 있습니다. 향후 Intermediate CA를 도입해도 `server.ini`의 경로는 바꾸지 않고 `trust-chain.pem` 내용만 갱신합니다. 서버가 DTLS handshake에서 상대방에게 전송할 자신의 인증서 체인은 `certificate_file`의 별도 책임이며 `ca_file`과 혼용하지 않습니다.
+로컬 발급 구성은 Intermediate CA 개인키로 클라이언트 인증서를 서명합니다. `server.ini`에 `[root_ca]`, `[intermediate_ca]`, `[intermediate_key]` PEM 섹션을 넣으면 웹 발급 기능이 해당 내용을 우선 사용합니다. `[certificate]`는 서버 자신의 인증서이고 `[ca]`는 상대방 인증서를 검증하는 신뢰 체인입니다.
 
 ### 웹 실시간 세션 제어
 
 VPN 서버는 `control_socket`에 Unix domain socket을 열어 로컬 관리 웹과 통신합니다. `WATCH` 구독이 연결되면 현재 세션 snapshot을 한 번 전송하고, 이후 클라이언트 연결·재연결·종료로 연결 목록이 바뀔 때만 새 snapshot을 push합니다. 브라우저에는 Express가 이 스트림을 SSE로 전달하므로 주기적인 HTTP polling을 사용하지 않습니다.
 
-웹에서 연결 끊기를 실행하면 Express가 `DISCONNECT <VPN IP>` 명령을 control socket으로 전달합니다. 서버는 해당 DTLS 세션을 즉시 제거하고 `web_disconnect` 사유를 syslog에 기록합니다. 이 작업은 활성 연결만 종료하며 `server.ini`의 인증서 지문/IP 등록은 삭제하지 않으므로 클라이언트가 다시 인증하면 재접속할 수 있습니다.
+웹에서 클라이언트를 삭제하면 `server.ini`의 등록 항목을 제거하고 `RELOAD` 명령으로 VPN 서버에 즉시 반영합니다. 서버는 삭제된 클라이언트의 활성 DTLS 세션을 제거합니다. `DISCONNECT <VPN IP>` 명령은 등록을 유지한 채 활성 연결만 끊는 별도 제어 명령으로 사용할 수 있습니다.
 
 control socket은 `server.ini`의 `control_socket`으로 지정하며 기본값은 `/var/run/autobricks-vpn.sock`입니다. 생성 권한은 `0660`이므로 VPN 서버와 웹 프로세스는 socket을 읽고 쓸 수 있는 동일한 운영 그룹으로 실행해야 합니다.
 
@@ -411,8 +413,10 @@ DTLS callback의 I/O context는 `Dtls`가 `Box`로 직접 소유합니다. 외�
 ```ini
 [client]
 10.8.1.2 = 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-10.8.1.3 = fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
+10.8.1.3 = fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 example-user example-password
 ```
+
+두 번째 항목처럼 ID와 암호를 붙이면 인증서 검증 후 로그인이 필요합니다. 둘 다 없는 항목은 인증서만 검증합니다. 로그인 정보는 서버 설정에만 저장하며 발급된 클라이언트 INI에는 넣지 않습니다.
 
 fingerprint는 `:`가 있어도 되지만 서버가 내부적으로 정규화합니다. fingerprint 확인은 다음처럼 할 수 있습니다.
 

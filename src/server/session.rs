@@ -12,6 +12,8 @@ pub(super) struct Session {
     pub(super) address: Ipv4Addr,
     pub(super) fingerprint: Option<String>,
     pub(super) established: bool,
+    pub(super) authenticated: bool,
+    pub(super) login_attempted: bool,
     pub(super) established_at: Option<Instant>,
     pub(super) last_activity: Instant,
     pub(super) dtls_deadline: Option<Instant>,
@@ -33,7 +35,7 @@ impl Drop for Session {
         self.enc_tx_queue.close();
         self.raw_tx_queue.close();
         self.control_wake.notify();
-        if self.established {
+        if self.authenticated {
             let duration_seconds = self
                 .established_at
                 .map(|started| started.elapsed().as_secs())

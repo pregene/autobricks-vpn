@@ -1,6 +1,21 @@
 use super::*;
 use autobricks_vpn::base::queue::TryPopError;
+use autobricks_vpn::{AUTH_FAILED, AUTH_LOGIN_PREFIX, AUTH_OK, AUTH_REQUIRED};
+use std::collections::HashSet;
 use std::thread;
+
+fn login_matches(packet: &[u8], id: &str, password: &str) -> bool {
+    packet
+        .strip_prefix(AUTH_LOGIN_PREFIX)
+        .and_then(|body| {
+            body.iter()
+                .position(|byte| *byte == 0)
+                .map(|index| (&body[..index], &body[index + 1..]))
+        })
+        .is_some_and(|(actual_id, actual_password)| {
+            actual_id == id.as_bytes() && actual_password == password.as_bytes()
+        })
+}
 
 fn write_tun_packet(tun: &Tun, packet: &[u8], active: &AtomicBool) -> io::Result<()> {
     while RUNNING.load(Ordering::Acquire) && active.load(Ordering::Acquire) {
@@ -55,6 +70,7 @@ pub(super) struct DecryptContext {
     pub(super) stateless_acceptor: Dtls,
     pub(super) sessions: Arc<Mutex<Vec<Session>>>,
     pub(super) bindings: HashMap<Ipv4Addr, String>,
+    pub(super) logins: HashMap<Ipv4Addr, (String, String)>,
     pub(super) handshake_limiter: IpRateLimiter,
     pub(super) max_clients: usize,
     pub(super) max_pending_handshakes: usize,
@@ -71,7 +87,7 @@ pub(super) struct DecryptContext {
     pub(super) retry_requested: Arc<AtomicBool>,
     pub(super) control_wake: Arc<control::ControlWake>,
     pub(super) error_receiver: mpsc::Receiver<io::Error>,
-    pub(super) reload_receiver: mpsc::Receiver<(HashMap<Ipv4Addr, String>, Dtls)>,
+    pub(super) reload_receiver: mpsc::Receiver<ReloadUpdate>,
 }
 
 pub(super) fn spawn(context: DecryptContext) -> io::Result<thread::JoinHandle<io::Result<()>>> {
@@ -91,6 +107,7 @@ fn run(context: DecryptContext) -> io::Result<()> {
         mut stateless_acceptor,
         sessions,
         mut bindings,
+        mut logins,
         mut handshake_limiter,
         max_clients,
         max_pending_handshakes,
@@ -130,6 +147,35 @@ fn run(context: DecryptContext) -> io::Result<()> {
                 match read_result {
                     Ok(DtlsIoResult::Complete(count)) if count > 0 => {
                         session.drain_pending = true;
+                        if !session.authenticated {
+                            if session.login_attempted {
+                                continue;
+                            }
+                            session.login_attempted = true;
+                            let login = &packet[..count];
+                            let credentials = logins.get(&session.address);
+                            let accepted =
+                                credentials.is_some_and(|(expected_id, expected_password)| {
+                                    login_matches(login, expected_id, expected_password)
+                                });
+                            if accepted {
+                                session.authenticated = true;
+                                session.last_activity = Instant::now();
+                                super::encrypt::queue_session_plain(session, AUTH_OK.to_vec());
+                                eprintln!("[server] client {} login succeeded", session.address);
+                                autobricks_vpn::syslog_connection_event(&format!(
+                                    "client connected vpn_ip={} fingerprint={}",
+                                    session.address,
+                                    session.fingerprint.as_deref().unwrap_or("")
+                                ));
+                                control_wake.notify();
+                            } else {
+                                super::encrypt::queue_session_plain(session, AUTH_FAILED.to_vec());
+                                eprintln!("[server] client {} login rejected", session.address);
+                            }
+                            tun_read_queue.notify_change();
+                            continue;
+                        }
                         if is_keepalive_packet(&packet[..count]) {
                             session.last_activity = Instant::now();
                             super::encrypt::queue_session_plain(session, KEEPALIVE_PACKET.to_vec());
@@ -187,10 +233,32 @@ fn run(context: DecryptContext) -> io::Result<()> {
                 session.established && (session.drain_pending || !session.pending_inject.is_empty())
             })
         };
+        {
+            let mut list = sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut seen = HashSet::new();
+            list.reverse();
+            list.retain_mut(|session| {
+                if session.authenticated && !seen.insert(session.address) {
+                    session.disconnect_reason = "replaced";
+                    false
+                } else {
+                    true
+                }
+            });
+            list.reverse();
+        }
         handshake_limiter.purge(Instant::now());
-        while let Ok((new_bindings, new_acceptor)) = reload_receiver.try_recv() {
+        while let Ok((new_bindings, new_logins, new_acceptor, ack_sender)) =
+            reload_receiver.try_recv()
+        {
             bindings = new_bindings;
+            logins = new_logins;
             stateless_acceptor = new_acceptor;
+            if let Some(ack_sender) = ack_sender {
+                let _ = ack_sender.send(());
+            }
         }
         if let Ok(error) = error_receiver.try_recv() {
             result = Err(error);
@@ -334,6 +402,8 @@ fn run(context: DecryptContext) -> io::Result<()> {
                         address: Ipv4Addr::UNSPECIFIED,
                         fingerprint: None,
                         established: false,
+                        authenticated: false,
+                        login_attempted: false,
                         established_at: None,
                         last_activity: Instant::now(),
                         dtls_deadline: None,
@@ -437,12 +507,19 @@ fn run(context: DecryptContext) -> io::Result<()> {
                     session.address = *address;
                     session.fingerprint = Some(fingerprint.clone());
                     session.established = true;
+                    session.authenticated = !logins.contains_key(address);
                     session.dtls.with(|dtls| dtls.disable_callback_receive());
                     session.established_at = Some(Instant::now());
                     session.dtls_deadline = None;
                     control_wake.notify();
                     let connected_peer = session.peer;
                     let connected_address = session.address;
+                    let authenticated = session.authenticated;
+                    if authenticated {
+                        super::encrypt::queue_session_plain(session, AUTH_OK.to_vec());
+                    } else {
+                        super::encrypt::queue_session_plain(session, AUTH_REQUIRED.to_vec());
+                    }
                     let replaces_existing = sessions.iter().any(|candidate| {
                         candidate.established
                             && candidate.address == connected_address
@@ -454,12 +531,15 @@ fn run(context: DecryptContext) -> io::Result<()> {
                         sessions.swap_remove(index);
                         continue;
                     }
-                    println!("[server] client {fingerprint} connected as {connected_address}");
-                    autobricks_vpn::syslog_connection_event(&format!(
-                        "client connected vpn_ip={connected_address} fingerprint={fingerprint}"
-                    ));
+                    if authenticated {
+                        println!("[server] client {fingerprint} connected as {connected_address}");
+                        autobricks_vpn::syslog_connection_event(&format!(
+                            "client connected vpn_ip={connected_address} fingerprint={fingerprint}"
+                        ));
+                    }
+                    tun_read_queue.notify_change();
                     let mut duplicate_index = 0;
-                    while duplicate_index < sessions.len() {
+                    while authenticated && duplicate_index < sessions.len() {
                         let duplicate = sessions[duplicate_index].established
                             && sessions[duplicate_index].address == connected_address
                             && !same_peer(&sessions[duplicate_index].peer, &connected_peer);
@@ -487,4 +567,20 @@ fn run(context: DecryptContext) -> io::Result<()> {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod login_tests {
+    use super::login_matches;
+    use autobricks_vpn::AUTH_LOGIN_PREFIX;
+
+    #[test]
+    fn login_frame_requires_matching_id_and_password() {
+        let mut frame = AUTH_LOGIN_PREFIX.to_vec();
+        frame.extend_from_slice(b"alice\0secret");
+        assert!(login_matches(&frame, "alice", "secret"));
+        assert!(!login_matches(&frame, "alice", "wrong"));
+        assert!(!login_matches(&frame, "bob", "secret"));
+        assert!(!login_matches(b"alice\0secret", "alice", "secret"));
+    }
 }

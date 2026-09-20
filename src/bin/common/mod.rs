@@ -4,9 +4,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 type RunFunction = unsafe extern "C" fn(*const c_char) -> c_int;
+type RunWithLoginFunction =
+    unsafe extern "C" fn(*const c_char, *const c_char, *const c_char) -> c_int;
 
-const PRODUCT_BANNER: &str =
-    "Autobricks VPN 1.0\nCopyright © 2026 Autobricks.co.kr. All rights reserved.";
+const PRODUCT_VERSION: &str = include_str!("../../../VERSION");
+const COPYRIGHT: &str = "Copyright © 2026 Autobricks.co.kr. All rights reserved.";
 
 fn library_path() -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("AUTOBRICKS_VPN_LIBRARY") {
@@ -27,10 +29,23 @@ fn library_path() -> io::Result<PathBuf> {
 
 enum Command {
     Help,
-    Run(String),
+    Run {
+        config: String,
+        user: Option<String>,
+        password: Option<String>,
+    },
 }
 
 fn usage(program: &str) -> String {
+    if program == "vpn-client" {
+        return format!(
+            "autobricks-vpn {program}\n\n\
+             Usage:\n  {program} [--config <FILE>] [--user <ID> --pass <PASSWORD>]\n\n\
+             Options:\n  -c, --config <FILE>  VPN configuration file (default: config/client.ini)\n  --user <ID>         Login ID; use with --pass\n  --pass <PASSWORD>   Login password; use with --user\n  -h, --help          Show this help and exit\n\n\
+             Without --user and --pass, credentials are requested when the server requires login.\n\n\
+             Environment:\n  AUTOBRICKS_VPN_LIBRARY  Override the dynamic library path"
+        );
+    }
     format!(
         "autobricks-vpn {program}\n\n\
          Usage:\n  {program} --config <FILE>\n\n\
@@ -39,9 +54,14 @@ fn usage(program: &str) -> String {
     )
 }
 
-fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Command, String> {
+fn parse_arguments(
+    arguments: impl IntoIterator<Item = String>,
+    client: bool,
+) -> Result<Command, String> {
     let mut arguments = arguments.into_iter();
     let mut config = None;
+    let mut user = None;
+    let mut password = None;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "-h" | "--help" => return Ok(Command::Help),
@@ -67,20 +87,77 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Comman
                 }
                 config = Some(value.to_owned());
             }
+            "--user" | "--pass" if client => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| format!("{argument} requires a value"))?;
+                if value.is_empty() {
+                    return Err(format!("{argument} must not be empty"));
+                }
+                let slot = if argument == "--user" {
+                    &mut user
+                } else {
+                    &mut password
+                };
+                if slot.is_some() {
+                    return Err(format!("{argument} may only be specified once"));
+                }
+                *slot = Some(value);
+            }
+            _ if client && argument.starts_with("--user=") => {
+                if user.is_some() {
+                    return Err("--user may only be specified once".into());
+                }
+                let value = argument.trim_start_matches("--user=");
+                if value.is_empty() {
+                    return Err("--user must not be empty".into());
+                }
+                user = Some(value.to_owned());
+            }
+            _ if client && argument.starts_with("--pass=") => {
+                if password.is_some() {
+                    return Err("--pass may only be specified once".into());
+                }
+                let value = argument.trim_start_matches("--pass=");
+                if value.is_empty() {
+                    return Err("--pass must not be empty".into());
+                }
+                password = Some(value.to_owned());
+            }
             _ => return Err(format!("unknown argument: {argument}")),
         }
     }
-    config
-        .map(Command::Run)
-        .ok_or_else(|| "missing required option: --config <FILE>".into())
+    if user.is_some() != password.is_some() {
+        return Err("--user and --pass must be provided together".into());
+    }
+    let config = if client {
+        config.unwrap_or_else(|| "config/client.ini".into())
+    } else {
+        config.ok_or_else(|| "missing required option: --config <FILE>".to_string())?
+    };
+    Ok(Command::Run {
+        config,
+        user,
+        password,
+    })
 }
 
-fn run(symbol: &[u8], config: &str) -> io::Result<()> {
+fn run(symbol: &[u8], config: &str, login: Option<(&str, &str)>) -> io::Result<()> {
     let library = DynamicLibrary::open(&library_path()?)?;
-    let run: RunFunction = unsafe { library.symbol(symbol)? };
     let config = CString::new(config)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "config path contains NUL"))?;
-    let result = unsafe { run(config.as_ptr()) };
+    let result = if let Some((user, password)) = login {
+        let run: RunWithLoginFunction =
+            unsafe { library.symbol(b"autobricks_vpn_client_run_with_login")? };
+        let user = CString::new(user)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "login ID contains NUL"))?;
+        let password = CString::new(password)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "password contains NUL"))?;
+        unsafe { run(config.as_ptr(), user.as_ptr(), password.as_ptr()) }
+    } else {
+        let run: RunFunction = unsafe { library.symbol(symbol)? };
+        unsafe { run(config.as_ptr()) }
+    };
     // The runtime installs signal/console handlers whose code lives in the library.
     // Keep it loaded until process termination so those callbacks never dangle.
     std::mem::forget(library);
@@ -94,13 +171,17 @@ fn run(symbol: &[u8], config: &str) -> io::Result<()> {
 }
 
 fn launch(program: &str, symbol: &[u8]) -> ExitCode {
-    println!("{PRODUCT_BANNER}");
-    match parse_arguments(std::env::args().skip(1)) {
+    println!("Autobricks VPN {}\n{COPYRIGHT}", PRODUCT_VERSION.trim());
+    match parse_arguments(std::env::args().skip(1), program == "vpn-client") {
         Ok(Command::Help) => {
             println!("{}", usage(program));
             ExitCode::SUCCESS
         }
-        Ok(Command::Run(config)) => match run(symbol, &config) {
+        Ok(Command::Run {
+            config,
+            user,
+            password,
+        }) => match run(symbol, &config, user.as_deref().zip(password.as_deref())) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("{program}: {error}");
@@ -230,27 +311,41 @@ mod tests {
     #[test]
     fn parses_config_options() {
         assert!(matches!(
-            parse_arguments(["--config".into(), "custom.ini".into()]),
-            Ok(Command::Run(path)) if path == "custom.ini"
+            parse_arguments(["--config".into(), "custom.ini".into()], false),
+            Ok(Command::Run { config, .. }) if config == "custom.ini"
         ));
         assert!(matches!(
-            parse_arguments(["--config=other.ini".into()]),
-            Ok(Command::Run(path)) if path == "other.ini"
+            parse_arguments(["--config=other.ini".into()], false),
+            Ok(Command::Run { config, .. }) if config == "other.ini"
         ));
     }
 
     #[test]
     fn handles_help_without_config() {
         assert!(matches!(
-            parse_arguments(["--help".into()]),
+            parse_arguments(["--help".into()], true),
             Ok(Command::Help)
         ));
     }
 
     #[test]
     fn rejects_missing_or_unknown_arguments() {
-        assert!(parse_arguments(Vec::<String>::new()).is_err());
-        assert!(parse_arguments(["client.ini".into()]).is_err());
-        assert!(parse_arguments(["--unknown".into()]).is_err());
+        assert!(parse_arguments(Vec::<String>::new(), false).is_err());
+        assert!(parse_arguments(["client.ini".into()], true).is_err());
+        assert!(parse_arguments(["--unknown".into()], true).is_err());
+    }
+
+    #[test]
+    fn client_login_options_use_default_config_and_require_a_pair() {
+        assert!(matches!(
+            parse_arguments(["--user".into(), "alice".into(), "--pass".into(), "secret".into()], true),
+            Ok(Command::Run { config, user: Some(user), password: Some(password) })
+                if config == "config/client.ini" && user == "alice" && password == "secret"
+        ));
+        assert!(parse_arguments(["--user".into(), "alice".into()], true).is_err());
+        assert!(parse_arguments(["--pass".into(), "secret".into()], false).is_err());
+        assert!(
+            matches!(parse_arguments(Vec::<String>::new(), true), Ok(Command::Run { config, .. }) if config == "config/client.ini")
+        );
     }
 }

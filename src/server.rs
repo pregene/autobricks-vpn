@@ -1,3 +1,4 @@
+use crate::client::materialize_embedded_credentials;
 use autobricks_vpn::{
     base::queue::Queue, base::worker::WorkerSignal, ipv4_destination, ipv4_in_cidr,
     ipv4_is_broadcast, ipv4_packet_addresses, is_keepalive_packet, panic_gate, parse_ini_entries,
@@ -59,6 +60,13 @@ struct UdpDatagram {
     packet: Vec<u8>,
 }
 
+type ReloadUpdate = (
+    HashMap<Ipv4Addr, String>,
+    HashMap<Ipv4Addr, (String, String)>,
+    Dtls,
+    Option<mpsc::Sender<()>>,
+);
+
 #[cfg(unix)]
 extern "C" fn stop(_signal: libc::c_int) {
     RUNNING.store(false, Ordering::Relaxed);
@@ -101,6 +109,29 @@ fn required_value(values: &HashMap<String, String>, key: &str) -> io::Result<Str
         })
 }
 
+fn client_logins(entries: &[(String, String)]) -> io::Result<HashMap<Ipv4Addr, (String, String)>> {
+    let mut logins = HashMap::new();
+    for (address, value) in entries {
+        let parts: Vec<_> = value.split_whitespace().collect();
+        match parts.as_slice() {
+            [_] => {}
+            [_, id, password] if !id.is_empty() && !password.is_empty() => {
+                let address = address
+                    .parse()
+                    .map_err(|_| io::Error::other("invalid client address"))?;
+                logins.insert(address, ((*id).to_string(), (*password).to_string()));
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid login fields for {address}"),
+                ))
+            }
+        }
+    }
+    Ok(logins)
+}
+
 fn duration_value(
     values: &HashMap<String, String>,
     key: &str,
@@ -138,7 +169,8 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
     RUNNING.store(true, Ordering::Relaxed);
     install_signal_handlers();
     eprintln!("[server] loading config: {path}");
-    let server = parse_ini_section(path, "server")?;
+    let mut server = parse_ini_section(path, "server")?;
+    let _embedded_credentials = materialize_embedded_credentials(path, &mut server)?;
     let clients = parse_ini_entries(path, "client")?;
     eprintln!("[server] config loaded: {} client bindings", clients.len());
     let max_clients: usize = value(&server, "max_clients", "64")
@@ -182,7 +214,8 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
     let max_session_lifetime = duration_value(&server, "max_session_lifetime", 3600, 60, 604_800)?;
     let config_reload_interval = duration_value(&server, "config_reload_interval", 30, 5, 3600)?;
     let control_socket_path = value(&server, "control_socket", "/var/run/autobricks-vpn.sock");
-    let control = ControlSocket::bind(control_socket_path.clone())?;
+    let control_socket_group = server.get("control_socket_group").map(String::as_str);
+    let control = ControlSocket::bind(control_socket_path.clone(), control_socket_group)?;
     let control_wake = control.wake_handle();
     eprintln!("[server] control socket listening at {control_socket_path}");
     let socket = std::net::UdpSocket::bind(SocketAddr::from((listen, port)))?;
@@ -201,6 +234,7 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
             "vpn_address is outside vpn_network",
         ));
     }
+    let logins = client_logins(&clients)?;
     let bindings = validate_client_bindings(clients, vpn_address, &vpn_network)?;
     let tun = Arc::new(Tun::open(&value(&server, "tun_name", "autobricks0"))?);
     eprintln!("[server] TUN opened: {}", tun.name());
@@ -290,6 +324,7 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
         config: Arc::clone(&config),
         cookie_secret,
         bindings: bindings.clone(),
+        logins: logins.clone(),
         vpn_address,
         vpn_network: vpn_network.clone(),
         next_config_reload,
@@ -305,6 +340,7 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
         stateless_acceptor,
         sessions,
         bindings,
+        logins,
         handshake_limiter,
         max_clients,
         max_pending_handshakes,
@@ -365,7 +401,10 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{drain_encrypted_queue, EncryptedDatagram, Queue};
+    use super::{
+        client_logins, drain_encrypted_queue, materialize_embedded_credentials, parse_ini_section,
+        validate_client_bindings, Config, Dtls, EncryptedDatagram, Queue,
+    };
     use std::io;
     use std::time::Instant;
 
@@ -398,5 +437,53 @@ mod tests {
         assert_eq!(blocked.len(), 1);
         assert!(ready.is_empty());
         assert_eq!(sent, vec![2]);
+    }
+
+    #[test]
+    fn login_fields_are_optional_but_must_be_complete() {
+        let address = "10.9.1.2".to_string();
+        assert!(client_logins(&[(address.clone(), "fingerprint".into())])
+            .unwrap()
+            .is_empty());
+        let logins =
+            client_logins(&[(address.clone(), "fingerprint alice secret".into())]).unwrap();
+        assert_eq!(
+            logins[&address.parse().unwrap()],
+            ("alice".into(), "secret".into())
+        );
+        assert!(client_logins(&[(address.clone(), "fingerprint alice".into())]).is_err());
+        assert!(client_logins(&[(address, "fingerprint alice secret extra".into())]).is_err());
+        let binding = validate_client_bindings(
+            vec![(
+                "10.9.1.2".into(),
+                format!("{} alice secret", "a".repeat(64)),
+            )],
+            "10.9.1.1".parse().unwrap(),
+            "10.9.1.0/24",
+        )
+        .unwrap();
+        assert_eq!(binding[&"10.9.1.2".parse().unwrap()], "a".repeat(64));
+    }
+
+    #[test]
+    fn configured_embedded_server_credentials_initialize_dtls() {
+        let Ok(path) = std::env::var("AVPN_TEST_SERVER_CONFIG") else {
+            return;
+        };
+        let mut values = parse_ini_section(&path, "server").unwrap();
+        let _credentials = materialize_embedded_credentials(&path, &mut values)
+            .unwrap()
+            .unwrap();
+        let config = Config {
+            server: true,
+            certificate_file: values["certificate_file"].clone(),
+            private_key_file: values["private_key_file"].clone(),
+            ca_file: Some(values["ca_file"].clone()),
+            crl_file: None,
+            ocsp_enabled: false,
+            ocsp_url: None,
+            mtu: 1350,
+        };
+        Dtls::new(&config).unwrap();
     }
 }

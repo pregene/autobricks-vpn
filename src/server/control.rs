@@ -1,9 +1,13 @@
 use super::decrypt::create_stateless_acceptor;
 use super::session::Session;
-use super::{poll, StopOnDrop, UdpDatagram, HANDSHAKE_TIMEOUT, RUNNING, SESSION_IDLE_TIMEOUT};
+use super::{
+    peer_ipv4, poll, ReloadUpdate, StopOnDrop, UdpDatagram, HANDSHAKE_TIMEOUT, RUNNING,
+    SESSION_IDLE_TIMEOUT,
+};
 use autobricks_vpn::base::queue::Queue;
-use autobricks_vpn::{panic_gate, parse_ini_entries, validate_client_bindings, Config, Dtls};
+use autobricks_vpn::{panic_gate, parse_ini_entries, validate_client_bindings, Config};
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fmt::Write as FmtWrite;
 use std::io;
 use std::io::{Read, Write};
@@ -24,6 +28,8 @@ pub(super) struct ControlSocket {
     pending: Vec<PendingCommand>,
     path: String,
     watchers: Vec<Watcher>,
+    reload_requested: bool,
+    reload_responses: Vec<UnixStream>,
     last_identity: String,
     identity_scratch: String,
 }
@@ -93,7 +99,7 @@ impl ControlWake {
 }
 
 impl ControlSocket {
-    pub(super) fn bind(path: String) -> io::Result<Self> {
+    pub(super) fn bind(path: String, group: Option<&str>) -> io::Result<Self> {
         match UnixStream::connect(&path) {
             Ok(_) => {
                 return Err(io::Error::new(
@@ -110,6 +116,24 @@ impl ControlSocket {
             std::fs::remove_file(&path)?;
         }
         let listener = UnixListener::bind(&path)?;
+        if let Some(group) = group {
+            let group = CString::new(group).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid control_socket_group")
+            })?;
+            let entry = unsafe { libc::getgrnam(group.as_ptr()) };
+            if entry.is_null() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "control_socket_group not found",
+                ));
+            }
+            let path_c = CString::new(path.as_str()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid control_socket path")
+            })?;
+            if unsafe { libc::chown(path_c.as_ptr(), !0, (*entry).gr_gid) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))?;
         listener.set_nonblocking(true)?;
         let (wake_reader, wake_writer) = UnixDatagram::pair()?;
@@ -122,6 +146,8 @@ impl ControlSocket {
             pending: Vec::new(),
             path,
             watchers: Vec::new(),
+            reload_requested: false,
+            reload_responses: Vec::new(),
             last_identity: String::new(),
             identity_scratch: String::with_capacity(4096),
         })
@@ -205,6 +231,9 @@ impl ControlSocket {
             let snapshot = session_snapshot(sessions);
             let _ = stream.write_all(snapshot.as_bytes());
             let _ = stream.write_all(b"\n");
+        } else if command == "RELOAD" {
+            self.reload_requested = true;
+            self.reload_responses.push(stream);
         } else if let Some(address) = command.strip_prefix("DISCONNECT ") {
             let Ok(address) = address.parse::<Ipv4Addr>() else {
                 let _ = stream.write_all(b"{\"ok\":false,\"error\":\"invalid_vpn_address\"}\n");
@@ -239,6 +268,17 @@ impl ControlSocket {
         }
         self.watchers.retain_mut(Watcher::flush);
     }
+
+    fn respond_reload(&mut self, ok: bool) {
+        let response = if ok {
+            b"{\"ok\":true}\n".as_slice()
+        } else {
+            b"{\"ok\":false,\"error\":\"reload_failed\"}\n".as_slice()
+        };
+        for mut stream in self.reload_responses.drain(..) {
+            let _ = stream.write_all(response);
+        }
+    }
 }
 
 impl Drop for ControlSocket {
@@ -256,13 +296,14 @@ pub(super) struct ControlContext {
     pub(super) config: Arc<Config>,
     pub(super) cookie_secret: [u8; 32],
     pub(super) bindings: HashMap<Ipv4Addr, String>,
+    pub(super) logins: HashMap<Ipv4Addr, (String, String)>,
     pub(super) vpn_address: Ipv4Addr,
     pub(super) vpn_network: String,
     pub(super) next_config_reload: Instant,
     pub(super) config_reload_interval: Duration,
     pub(super) max_session_lifetime: Duration,
     pub(super) active: Arc<AtomicBool>,
-    pub(super) reload_sender: mpsc::Sender<(HashMap<Ipv4Addr, String>, Dtls)>,
+    pub(super) reload_sender: mpsc::Sender<ReloadUpdate>,
 }
 
 pub(super) fn spawn(context: ControlContext) -> io::Result<JoinHandle<io::Result<()>>> {
@@ -284,6 +325,7 @@ fn run(context: ControlContext) -> io::Result<()> {
         config,
         cookie_secret,
         mut bindings,
+        mut logins,
         vpn_address,
         vpn_network,
         mut next_config_reload,
@@ -320,7 +362,7 @@ fn run(context: ControlContext) -> io::Result<()> {
                 index += 1;
             }
             list.retain_mut(|session| {
-                let idle_valid = session.last_activity.elapsed() < if session.established { SESSION_IDLE_TIMEOUT } else { HANDSHAKE_TIMEOUT };
+                let idle_valid = session.last_activity.elapsed() < if session.authenticated { SESSION_IDLE_TIMEOUT } else if session.established { Duration::from_secs(120) } else { HANDSHAKE_TIMEOUT };
                 let lifetime_valid = !session.established_at.is_some_and(|started| started.elapsed() >= max_session_lifetime);
                 if idle_valid && !lifetime_valid {
                     session.disconnect_reason = "max_session_lifetime";
@@ -331,15 +373,21 @@ fn run(context: ControlContext) -> io::Result<()> {
             });
             control.publish_if_changed(&list);
         }
-        if now >= next_config_reload {
+        let reload_requested = mem::take(&mut control.reload_requested);
+        if now >= next_config_reload || reload_requested {
             let reload = parse_ini_entries(&path, "client")
-                .and_then(|entries| validate_client_bindings(entries, vpn_address, &vpn_network))
-                .and_then(|new_bindings| {
+                .and_then(|entries| {
+                    let new_logins = super::client_logins(&entries)?;
+                    let new_bindings =
+                        validate_client_bindings(entries, vpn_address, &vpn_network)?;
+                    Ok((new_bindings, new_logins))
+                })
+                .and_then(|(new_bindings, new_logins)| {
                     create_stateless_acceptor(fd, &config, &cookie_secret)
-                        .map(|acceptor| (new_bindings, acceptor))
+                        .map(|acceptor| (new_bindings, new_logins, acceptor))
                 });
             match reload {
-                Ok((new_bindings, acceptor)) => {
+                Ok((new_bindings, new_logins, acceptor)) => {
                     let changed = bindings != new_bindings;
                     {
                         let mut list = sessions
@@ -351,7 +399,8 @@ fn run(context: ControlContext) -> io::Result<()> {
                             }
                             let authorized = session.fingerprint.as_ref().is_some_and(|actual| {
                                 new_bindings.get(&session.address) == Some(actual)
-                            });
+                            }) && logins.get(&session.address)
+                                == new_logins.get(&session.address);
                             if !authorized {
                                 session.disconnect_reason = "binding_revoked";
                                 eprintln!(
@@ -364,17 +413,35 @@ fn run(context: ControlContext) -> io::Result<()> {
                         control.publish_if_changed(&list);
                     }
                     bindings = new_bindings.clone();
-                    if reload_sender.send((new_bindings, acceptor)).is_err() {
+                    logins = new_logins.clone();
+                    let (ack_sender, ack_receiver) = mpsc::channel();
+                    if reload_sender
+                        .send((
+                            new_bindings,
+                            new_logins,
+                            acceptor,
+                            reload_requested.then_some(ack_sender),
+                        ))
+                        .is_err()
+                    {
                         break;
                     }
                     udp_rx_queue.notify_change();
                     if changed {
                         eprintln!("[server] client fingerprint bindings reloaded");
                     }
+                    if reload_requested {
+                        control.respond_reload(
+                            ack_receiver.recv_timeout(Duration::from_secs(2)).is_ok(),
+                        );
+                    }
                 }
-                Err(error) => eprintln!(
-                    "[server] configuration reload rejected; keeping current state: {error}"
-                ),
+                Err(error) => {
+                    eprintln!(
+                        "[server] configuration reload rejected; keeping current state: {error}"
+                    );
+                    control.respond_reload(false);
+                }
             }
             next_config_reload = Instant::now() + config_reload_interval;
         }
@@ -384,8 +451,10 @@ fn run(context: ControlContext) -> io::Result<()> {
             .iter()
             .flat_map(|session| {
                 let idle = session.last_activity
-                    + if session.established {
+                    + if session.authenticated {
                         SESSION_IDLE_TIMEOUT
+                    } else if session.established {
+                        Duration::from_secs(120)
                     } else {
                         HANDSHAKE_TIMEOUT
                     };
@@ -449,12 +518,15 @@ fn run(context: ControlContext) -> io::Result<()> {
 }
 
 fn write_session_identity(output: &mut String, sessions: &[Session]) {
-    for session in sessions.iter().filter(|session| session.established) {
+    for session in sessions.iter().filter(|session| session.authenticated) {
         let _ = write!(
             output,
-            "{}:{}|",
+            "{}:{}:{}|",
             session.address,
-            session.fingerprint.as_deref().unwrap_or("")
+            session.fingerprint.as_deref().unwrap_or(""),
+            peer_ipv4(&session.peer)
+                .map(|ip| ip.to_string())
+                .unwrap_or_default()
         );
     }
 }
@@ -463,16 +535,17 @@ fn session_snapshot(sessions: &[Session]) -> String {
     let mut output = String::with_capacity(256 + sessions.len() * 256);
     output.push_str("{\"type\":\"sessions\",\"sessions\":[");
     let mut first = true;
-    for session in sessions.iter().filter(|session| session.established) {
+    for session in sessions.iter().filter(|session| session.authenticated) {
         if !first {
             output.push(',');
         }
         first = false;
         let _ = write!(
             output,
-            "{{\"vpnAddress\":\"{}\",\"fingerprint\":\"{}\",\"connectedSeconds\":{},\"bytesTx\":{},\"bytesRx\":{},\"packetsTx\":{},\"packetsRx\":{}}}",
+            "{{\"vpnAddress\":\"{}\",\"fingerprint\":\"{}\",\"clientIp\":\"{}\",\"connectedSeconds\":{},\"bytesTx\":{},\"bytesRx\":{},\"packetsTx\":{},\"packetsRx\":{}}}",
             session.address,
             session.fingerprint.as_deref().unwrap_or(""),
+            peer_ipv4(&session.peer).map(|ip| ip.to_string()).unwrap_or_default(),
             session.established_at.map(|value| value.elapsed().as_secs()).unwrap_or(0),
             session.bytes_tx,
             session.bytes_rx,
@@ -497,7 +570,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = format!("/tmp/avpn-control-{}-{nonce}.sock", std::process::id());
-        ControlSocket::bind(path).unwrap()
+        ControlSocket::bind(path, None).unwrap()
     }
 
     #[test]
@@ -532,6 +605,20 @@ mod tests {
             response,
             "{\"ok\":false,\"error\":\"invalid_vpn_address\"}\n"
         );
+    }
+
+    #[test]
+    fn reload_command_waits_for_reload_result() {
+        let mut control = control();
+        let mut client = UnixStream::connect(&control.path).unwrap();
+        client.write_all(b"RELOAD\n").unwrap();
+        control.process(&mut Vec::new()).unwrap();
+        assert!(control.reload_requested);
+        assert_eq!(control.reload_responses.len(), 1);
+        control.respond_reload(true);
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert_eq!(response, "{\"ok\":true}\n");
     }
 
     #[test]

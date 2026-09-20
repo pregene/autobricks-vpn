@@ -21,7 +21,7 @@ export class VpnControl {
     });
   }
 
-  watch(onMessage, onError) {
+  watch(onMessage, onError, onClose = () => {}) {
     const socket = net.createConnection(this.socketPath);
     let buffer = "";
     socket.setEncoding("utf8");
@@ -38,6 +38,7 @@ export class VpnControl {
       }
     });
     socket.on("error", onError);
+    socket.on("close", onClose);
     return socket;
   }
 }
