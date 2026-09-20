@@ -1,0 +1,115 @@
+<mxfile host="65bd71144e">
+    <diagram id="server-architecture" name="Server architecture">
+        <mxGraphModel dx="1339" dy="1571" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1700" pageHeight="950" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="title" value="Autobricks VPN 서버 구조" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1e3a5f;strokeColor=#1e3a5f;fontColor=#1f2937;fontSize=24;align=center;verticalAlign=middle;spacing=8;fontColor=#ffffff;fontStyle=1;" parent="1" vertex="1">
+                    <mxGeometry x="40" y="20" width="1600" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="init" value="시작 / 초기화: server.ini 및 인증서 검증 · UDP bind · TUN 설정 · IPv4 forwarding 활성화" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f1f5f9;strokeColor=#94a3b8;fontColor=#1f2937;fontSize=14;align=center;verticalAlign=middle;spacing=8;" parent="1" vertex="1">
+                    <mxGeometry x="40" y="85" width="1080" height="75" as="geometry"/>
+                </mxCell>
+                <mxCell id="legend" value="화살표: 패킷 흐름　　점선: 설정 / 제어" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8fafc;strokeColor=#cbd5e1;fontColor=#1f2937;fontSize=13;align=center;verticalAlign=middle;spacing=8;" parent="1" vertex="1">
+                    <mxGeometry x="1160" y="95" width="480" height="55" as="geometry"/>
+                </mxCell>
+                <mxCell id="client_rx" value="VPN 클라이언트&lt;br/&gt;암호화 UDP" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontColor=#1f2937;fontSize=14;align=center;verticalAlign=middle;spacing=8;" parent="1" vertex="1">
+                    <mxGeometry x="50" y="260" width="170" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="udp_rx" value="UDP Read&lt;br/&gt;메인 스레드" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#1f2937;fontSize=14;align=center;verticalAlign=middle;spacing=8;" parent="1" vertex="1">
+                    <mxGeometry x="270" y="260" width="180" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="udp_queue" value="udp_rx_queue&lt;br/&gt;bounded queue" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontColor=#1f2937;fontSize=14;align=center;verticalAlign=middle;spacing=8;" parent="1" vertex="1">
+                    <mxGeometry x="490" y="260" width="180" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="decrypt" value="Decrypt worker&lt;br/&gt;DTLS handshake / 복호화&lt;br/&gt;IP 검사 · Session 공유" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#1f2937;fontSize=14;align=center;verticalAlign=middle;spacing=8;" parent="1" vertex="1">
+                    <mxGeometry x="735" y="247.5" width="210" height="95" as="geometry"/>
+                </mxCell>
+                <mxCell id="tun_write" value="TUN write&lt;br/&gt;Decrypt worker가 직접 기록" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontColor=#1f2937;fontSize=14;align=center;verticalAlign=middle;spacing=8;" parent="1" vertex="1">
+                    <mxGeometry x="1060" y="260" width="200" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="tun" value="TUN 장치&lt;br/&gt;VPN 네트워크" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontColor=#1f2937;fontSize=14;align=center;verticalAlign=middle;spacing=8;" parent="1" vertex="1">
+                    <mxGeometry x="1360" y="260" width="190" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="client_tx" value="VPN 클라이언트&lt;br/&gt;암호화 UDP" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontColor=#1f2937;fontSize=14;align=center;verticalAlign=middle;spacing=8;" parent="1" vertex="1">
+                    <mxGeometry x="1510" y="485" width="170" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="udp_tx" value="UDP Write worker&lt;br/&gt;Session별 전송 큐 배출" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#1f2937;fontSize=14;align=center;verticalAlign=middle;spacing=8;" parent="1" vertex="1">
+                    <mxGeometry x="1280" y="485" width="190" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="enc_queue" value="세션별 enc_tx_queue&lt;br/&gt;암호화 datagram" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontColor=#1f2937;fontSize=14;align=center;verticalAlign=middle;spacing=8;" parent="1" vertex="1">
+                    <mxGeometry x="1040" y="485" width="200" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="encrypt" value="Encrypt worker&lt;br/&gt;목적지 VPN IP 라우팅&lt;br/&gt;DTLS 암호화 · Session 공유" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#1f2937;fontSize=14;align=center;verticalAlign=middle;spacing=8;" parent="1" vertex="1">
+                    <mxGeometry x="720" y="472.5" width="210" height="95" as="geometry"/>
+                </mxCell>
+                <mxCell id="tun_queue" value="tun_read_queue&lt;br/&gt;bounded queue" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontColor=#1f2937;fontSize=14;align=center;verticalAlign=middle;spacing=8;" parent="1" vertex="1">
+                    <mxGeometry x="495" y="485" width="180" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="tun_rx" value="TUN Read worker" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#1f2937;fontSize=14;align=center;verticalAlign=middle;spacing=8;" parent="1" vertex="1">
+                    <mxGeometry x="275" y="485" width="180" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="sessions" value="공유 Session 목록 (Mutex)&lt;br/&gt;peer · VPN IP · fingerprint · DTLS&lt;br/&gt;Session별 raw_tx_queue / enc_tx_queue" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontColor=#1f2937;fontSize=14;align=center;verticalAlign=middle;spacing=8;" parent="1" vertex="1">
+                    <mxGeometry x="1060" y="740" width="360" height="100" as="geometry"/>
+                </mxCell>
+                <mxCell id="control" value="Session Control worker&lt;br/&gt;만료 · 재전송 · 설정/인증서 reload&lt;br/&gt;Unix control socket: WATCH / DISCONNECT" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontColor=#1f2937;fontSize=14;align=center;verticalAlign=middle;spacing=8;" parent="1" vertex="1">
+                    <mxGeometry x="490" y="740" width="340" height="100" as="geometry"/>
+                </mxCell>
+                <mxCell id="config" value="server.ini / 인증서 / CA&lt;br/&gt;client fingerprint binding" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f1f5f9;strokeColor=#94a3b8;fontColor=#1f2937;fontSize=14;align=center;verticalAlign=middle;spacing=8;" parent="1" vertex="1">
+                    <mxGeometry x="40" y="752.5" width="270" height="75" as="geometry"/>
+                </mxCell>
+                <mxCell id="e1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#64748b;strokeWidth=2;endArrow=block;endFill=1;fontColor=#334155;fontSize=12;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" parent="1" source="client_rx" target="udp_rx" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#64748b;strokeWidth=2;endArrow=block;endFill=1;fontColor=#334155;fontSize=12;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" parent="1" source="udp_rx" target="udp_queue" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#64748b;strokeWidth=2;endArrow=block;endFill=1;fontColor=#334155;fontSize=12;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" parent="1" source="udp_queue" target="decrypt" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e4" value="IPv4 payload" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#64748b;strokeWidth=2;endArrow=block;endFill=1;fontColor=#334155;fontSize=12;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" parent="1" source="decrypt" target="tun_write" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e5" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#64748b;strokeWidth=2;endArrow=block;endFill=1;fontColor=#334155;fontSize=12;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" parent="1" source="tun_write" target="tun" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e6" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#64748b;strokeWidth=2;endArrow=block;endFill=1;fontColor=#334155;fontSize=12;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" parent="1" source="tun_out" target="tun_rx" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e7" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#64748b;strokeWidth=2;endArrow=block;endFill=1;fontColor=#334155;fontSize=12;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" parent="1" source="tun_rx" target="tun_queue" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e8" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#64748b;strokeWidth=2;endArrow=block;endFill=1;fontColor=#334155;fontSize=12;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" parent="1" source="tun_queue" target="encrypt" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e9" value="DTLS output" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#64748b;strokeWidth=2;endArrow=block;endFill=1;fontColor=#334155;fontSize=12;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" parent="1" source="encrypt" target="enc_queue" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e10" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#64748b;strokeWidth=2;endArrow=block;endFill=1;fontColor=#334155;fontSize=12;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" parent="1" source="enc_queue" target="udp_tx" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e11" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#64748b;strokeWidth=2;endArrow=block;endFill=1;fontColor=#334155;fontSize=12;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" parent="1" source="udp_tx" target="client_tx" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="lane_rx" value="수신: 클라이언트 → 서버 TUN" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#93c5fd;fontColor=#1f2937;fontSize=16;align=center;verticalAlign=middle;spacing=8;" vertex="1" parent="1">
+                    <mxGeometry x="40" y="185" width="1600" height="36" as="geometry"/>
+                </mxCell>
+                <mxCell id="lane_tx" value="송신: 서버 TUN → 클라이언트" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dcfce7;strokeColor=#86efac;fontColor=#1f2937;fontSize=16;align=center;verticalAlign=middle;spacing=8;" vertex="1" parent="1">
+                    <mxGeometry x="40" y="410" width="1600" height="36" as="geometry"/>
+                </mxCell>
+                <mxCell id="lane_ctrl" value="세션 및 운영 제어" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f3e8ff;strokeColor=#c4b5fd;fontColor=#1f2937;fontSize=16;align=center;verticalAlign=middle;spacing=8;" vertex="1" parent="1">
+                    <mxGeometry x="40" y="635" width="1600" height="36" as="geometry"/>
+                </mxCell>
+                <mxCell id="tun_out" value="TUN 장치&lt;br/&gt;VPN 네트워크" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontColor=#1f2937;fontSize=14;align=center;verticalAlign=middle;spacing=8;" vertex="1" parent="1">
+                    <mxGeometry x="50" y="485" width="180" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="control_config" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#8b5cf6;strokeWidth=2;endArrow=block;endFill=1;dashed=1;dashPattern=6 4;" edge="1" parent="1" source="config" target="control">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="control_sessions" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#8b5cf6;strokeWidth=2;endArrow=block;endFill=1;dashed=1;dashPattern=6 4;" edge="1" parent="1" source="control" target="sessions">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+</mxfile>
