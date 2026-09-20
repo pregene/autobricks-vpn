@@ -244,6 +244,8 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
         Arc::clone(&active),
         Arc::clone(&plain_drops),
         error_sender.clone(),
+        #[cfg(target_os = "macos")]
+        vpn_address,
     )?;
 
     let encrypt_worker = encrypt::spawn(
