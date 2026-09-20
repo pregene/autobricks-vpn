@@ -48,101 +48,49 @@ Copyright © 2026 Autobricks.co.kr. All rights reserved.
 
 ## 서버·클라이언트 패킷 처리 구성
 
-### 현재 구현: 클라이언트 6-thread I/O pipeline
+### 클라이언트
 
-클라이언트는 단일 DTLS 세션을 사용하며, UDP/TUN 읽기, 복호화·암호화 작업, UDP/TUN 쓰기를 각각 분리합니다. 두 Read thread는 입력을 읽어 bounded queue에 넣고 작업 thread를 깨우는 일만 수행합니다.
-파일별 역할과 큐 경계는 [CLIENT.md](CLIENT.md)에 정리했습니다.
+클라이언트는 DTLS 세션 하나와 6개 작업 스레드를 사용합니다. UDP Read는 수신 데이터그램을 `encrypted_rx`에 넣고, Decrypt worker가 이를 꺼내 `wolfSSL_inject()`와 `wolfSSL_read()`를 호출합니다. 따라서 `encrypted_rx`는 `inject()`를 대신하는 큐가 아니라 두 스레드 사이의 전달 큐입니다. 네 큐의 용량은 각각 512패킷입니다. 파일별 역할은 [CLIENT.md](CLIENT.md)에 정리했습니다.
 
 ```mermaid
 flowchart LR
-    subgraph Client[macOS client]
-        CUDP[(connected UDP socket)]
-        CUR["Thread 1<br/>UDP Read<br/>drain until WouldBlock"]
-        CEQ["Queue encrypted_rx<br/>capacity 1024<br/>Mutex + Condvar"]
-        CDW["Thread 2<br/>DTLS Decrypt"]
-        CTQ["Queue tun_write"]
-        CTW["Thread 3<br/>TUN Write"]
-        UTUN[(utun)]
-        CTR["Thread 4<br/>TUN Read"]
-        CPQ["Queue raw_tx<br/>capacity 1024<br/>Mutex + Condvar"]
-        CEW["Thread 5<br/>DTLS Encrypt"]
-        CXQ["Queue enc_tx"]
-        CUW["Thread 6<br/>UDP Write"]
-
-        CUDP --> CUR --> CEQ --> CDW --> CTQ --> CTW --> UTUN
-        UTUN --> CTR --> CPQ --> CEW --> CXQ --> CUW --> CUDP
+    subgraph CRX["수신: 서버 → 클라이언트 TUN"]
+        direction LR
+        CS1["VPN 서버"] --> CR1["UDP Read"] --> CQ1["encrypted_rx<br/>512"] --> CD["Decrypt worker<br/>inject + read"] --> CQ2["tun_write<br/>512"] --> CW1["TUN Write"] --> CT1["로컬 TUN"]
     end
-
-    subgraph Server[Linux server]
-        SUDP[(UDP socket)]
-        SUR["Thread 1<br/>UDP Read<br/>drain until WouldBlock"]
-        SEQ["Queue encrypted_rx<br/>capacity 4096<br/>Mutex + Condvar"]
-        SDW["Thread 2 / main session loop<br/>peer lookup + handshake<br/>DTLS decrypt + TUN Write"]
-        STUN[(autobricks0)]
-        STR["Thread 3<br/>TUN Read"]
-        SPQ["Queue plain_tx<br/>capacity 4096<br/>Mutex + Condvar"]
-        SUW["Thread 4<br/>destination lookup<br/>DTLS encrypt + UDP Write"]
-        CTL["Local control socket<br/>STATUS / WATCH / DISCONNECT"]
-        WEB["Express 127.0.0.1<br/>SSE push"]
-
-        SUDP --> SUR --> SEQ --> SDW --> STUN
-        STUN --> STR --> SPQ --> SUW --> SUDP
-        WEB <-->|Unix socket| CTL -. session state .-> SDW
+    subgraph CTX["송신: 클라이언트 TUN → 서버"]
+        direction LR
+        CT2["로컬 TUN"] --> CR2["TUN Read"] --> CQ3["raw_tx<br/>512"] --> CE["Encrypt worker<br/>DTLS write"] --> CQ4["enc_tx<br/>512"] --> CW2["UDP Write"] --> CS2["VPN 서버"]
     end
-
-    CUDP <-->|DTLS 1.3 datagrams| SUDP
 ```
 
-`Queue<T>`는 내부 `Mutex`와 `Condvar`를 가지며 생성할 때 최대 packet 수를 결정합니다. 생산자는 queue가 가득 찰 때 기다리지 않고 가장 오래된 packet을 제거한 뒤 새 packet을 넣고 소비자를 즉시 깨웁니다. 소비자는 queue가 비어 있을 때만 `Condvar`에서 대기합니다. 종료 시에는 stop bit를 먼저 설정하고 queue를 닫아 대기 중인 작업 thread를 깨우며, 남은 packet은 처리하지 않습니다.
+메인 스레드는 설정 로드, TUN·DNS 설정, UDP 연결과 DTLS handshake를 수행한 뒤 작업 스레드를 시작합니다. 연결 중에는 keepalive를 `raw_tx`에 넣고 서버 응답을 감시하며, 연결이 끊기면 재접속합니다. Decrypt와 Encrypt worker는 같은 `SynchronizedDtls` 세션의 wolfSSL 호출을 직렬화합니다.
 
-각 wolfSSL session은 `SynchronizedDtls`가 소유합니다. queue 대기와 UDP/TUN read에는 session mutex를 사용하지 않고, 동일 `WOLFSSL*`에 대한 handshake/read/write/timeout 호출 구간만 직렬화합니다. 서버의 control socket은 로컬 Express 관리 프로세스에만 연결되며 `WATCH` 상태 변경을 SSE로 전달하므로 HTTP 주기 polling은 없습니다.
+### 서버
 
-### 현재 패킷 흐름
+서버는 메인 스레드의 UDP Read와 Decrypt, TUN Read, Encrypt, UDP Write, Session Control 작업 스레드로 구성됩니다. 수신 경로의 Decrypt worker가 peer별 DTLS handshake·복호화·출발지 VPN IP 검사를 처리하고 TUN에 직접 기록합니다. 송신 경로의 Encrypt worker는 목적지 VPN IP로 세션을 찾아 암호화하며, UDP Write worker가 세션별 암호문 큐를 전송합니다.
 
-클라이언트에서 서버로 보내는 흐름은 다음과 같습니다.
-
-```text
-Application
-  -> macOS IP stack
-  -> utun
-  -> client TUN Read
-  -> raw TX queue
-  -> client wolfSSL DTLS encrypt
-  -> encrypted TX queue
-  -> client UDP Write
-  -> Internet UDP
-  -> server UDP Read
-  -> encrypted RX queue
-  -> endpoint session lookup
-  -> server wolfSSL DTLS decrypt
-  -> source VPN IP validation
-  -> server TUN write
-  -> server IP stack / destination service
+```mermaid
+flowchart LR
+    subgraph SRX["수신: 클라이언트 → 서버 TUN"]
+        direction LR
+        SC1["VPN 클라이언트"] --> SR1["UDP Read<br/>메인 스레드"] --> SQ1["udp_rx_queue<br/>4096"] --> SD["Decrypt worker<br/>handshake + decrypt + IP 검사"] --> STW["TUN 직접 기록"] --> ST1["서버 TUN"]
+    end
+    subgraph STX["송신: 서버 TUN → 클라이언트"]
+        direction LR
+        ST2["서버 TUN"] --> SR2["TUN Read"] --> SQ2["tun_read_queue<br/>4096"] --> SE["Encrypt worker<br/>목적지 세션 선택"] --> SQ3["세션별 raw_tx_queue<br/>512"] --> SDTLS["DTLS write<br/>Encrypt worker"] --> SQ4["세션별 enc_tx_queue<br/>512"] --> SW["UDP Write"] --> SC2["VPN 클라이언트"]
+    end
 ```
 
-서버에서 클라이언트로 보내는 흐름은 다음과 같습니다.
+각 세션은 peer 주소, 할당된 VPN IP, 인증서 fingerprint, `SynchronizedDtls`, 평문 `raw_tx_queue`와 암호문 `enc_tx_queue`를 보유합니다. Session Control worker는 세션 만료·DTLS 재전송·설정 및 인증서 재로드를 처리하고 Unix control socket의 `WATCH`·`DISCONNECT` 명령을 받습니다. Express 운영 화면은 이 소켓의 상태 변경을 SSE로 전달합니다.
 
-```text
-Server service / remote VPN client
-  -> server IP stack
-  -> autobricks0 TUN
-  -> server TUN Read
-  -> plain TX queue
-  -> destination VPN IP session lookup
-  -> session wolfSSL DTLS encrypt
-  -> server UDP Write
-  -> Internet UDP
-  -> client UDP Read
-  -> encrypted RX queue
-  -> client DTLS decrypt
-  -> IPv4 packet validation
-  -> TUN write queue
-  -> utun write
-  -> macOS IP stack
-  -> Application
+```mermaid
+flowchart LR
+    CFG["server.ini · 인증서 · 클라이언트 binding"] --> CTRL["Session Control worker<br/>만료 · 재전송 · reload"] --> SESS["공유 Session 목록"]
+    WEB["Express 운영 화면"] <-->|Unix socket| CTRL
 ```
 
-Queue가 가득 차면 가장 오래된 packet을 제거해 메모리 사용량과 지연을 제한합니다. 방향별 overflow 수는 연결 또는 서버 종료 시 로그로 출력합니다. TCP 신뢰성과 재전송은 tunnel 내부의 TCP endpoint가 담당하며 DTLS application data 자체는 손실 packet을 재전송하지 않습니다.
+`Queue<T>`는 용량이 찼을 때 가장 오래된 패킷을 제거하고 소비자를 깨웁니다. 종료할 때는 큐를 닫아 대기 중인 작업을 깨웁니다. 서버의 두 공용 큐는 각각 4096패킷, 세션별 송신 큐는 각각 512패킷입니다. 방향별 overflow 수는 클라이언트 연결 또는 서버 종료 시 로그로 출력합니다. TCP 신뢰성과 재전송은 터널 내부 TCP endpoint가 담당하며, DTLS application data 자체는 손실 패킷을 재전송하지 않습니다.
 
 ## 개발환경 구성
 
