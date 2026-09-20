@@ -25,6 +25,15 @@ build/
 .DS_Store
 .obsidian/
 certs/
+config/
+# Local VPN settings and PKI material must stay off GitHub.
+*.ini
+*.pem
+*.crt
+*.key
+*.csr
+*.p12
+*.pfx
 docs/
 release/
 testdata/

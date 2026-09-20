@@ -5,7 +5,7 @@ import { readServerSettings, ServerConfig } from "./server-config.js";
 import { VpnControl } from "./vpn-control.js";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
-const configPath = path.resolve(process.env.VPN_CONFIG ?? path.join(currentDirectory, "../../server.ini"));
+const configPath = path.resolve(process.env.VPN_CONFIG ?? path.join(currentDirectory, "../../config/server.ini"));
 const settings = readServerSettings(configPath);
 const host = "127.0.0.1";
 const port = settings.port;
