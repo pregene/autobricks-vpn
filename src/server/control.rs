@@ -248,6 +248,7 @@ impl Drop for ControlSocket {
 }
 
 pub(super) struct ControlContext {
+    pub(super) udp_rx_queue: Arc<Queue<UdpDatagram>>,
     pub(super) control: ControlSocket,
     pub(super) sessions: Arc<Mutex<Vec<Session>>>,
     pub(super) path: String,
@@ -262,7 +263,6 @@ pub(super) struct ControlContext {
     pub(super) max_session_lifetime: Duration,
     pub(super) active: Arc<AtomicBool>,
     pub(super) reload_sender: mpsc::Sender<(HashMap<Ipv4Addr, String>, Dtls)>,
-    pub(super) udp_rx_queue: Arc<Queue<UdpDatagram>>,
 }
 
 pub(super) fn spawn(context: ControlContext) -> io::Result<JoinHandle<io::Result<()>>> {
@@ -276,6 +276,7 @@ pub(super) fn spawn(context: ControlContext) -> io::Result<JoinHandle<io::Result
 
 fn run(context: ControlContext) -> io::Result<()> {
     let ControlContext {
+        udp_rx_queue,
         mut control,
         sessions,
         path,
@@ -290,7 +291,6 @@ fn run(context: ControlContext) -> io::Result<()> {
         max_session_lifetime,
         active,
         reload_sender,
-        udp_rx_queue,
     } = context;
     while RUNNING.load(Ordering::Acquire) && active.load(Ordering::Acquire) {
         let now = Instant::now();

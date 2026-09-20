@@ -1,7 +1,8 @@
-use super::{ClientDiagnostics, DTLS_READ_DRAIN_LIMIT, RUNNING};
+use super::{ClientDiagnostics, RUNNING};
 use autobricks_vpn::{
-    base::queue::Queue, base::worker::WorkerSignal, ipv4_packet_addresses, is_keepalive_packet,
-    panic_gate, DtlsIoResult, SynchronizedDtls,
+    base::queue::{Queue, TryPopError},
+    base::worker::WorkerSignal,
+    ipv4_packet_addresses, is_keepalive_packet, panic_gate, DtlsIoResult, SynchronizedDtls,
 };
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,84 +35,80 @@ pub(super) fn spawn(context: DecryptContext) -> io::Result<JoinHandle<()>> {
                 diagnostics,
                 errors,
             } = context;
-            let mut packet = [0u8; 2048];
-            let mut drain_pending = false;
+            let mut plain = [0u8; 2048];
+            let mut pending: Option<Vec<u8>> = None;
+            let mut drain = false;
             while RUNNING.load(Ordering::Acquire) && active.load(Ordering::Acquire) {
                 let observed = progress.generation();
-                if queue.is_empty() && !drain_pending {
-                    if queue.is_closed() {
-                        break;
-                    }
-                    progress.wait(observed);
-                    continue;
-                }
-                let mut made_progress = false;
-                for _ in 0..DTLS_READ_DRAIN_LIMIT {
-                    if queue.is_empty() && !drain_pending {
-                        break;
-                    }
-                    let result = panic_gate("client DTLS read worker", || {
-                        dtls.with(|dtls| {
-                            let before = dtls.receive_callback_stats().0;
-                            let result = dtls.read_status(&mut packet);
-                            let after = dtls.receive_callback_stats().0;
-                            result.map(|status| (status, after > before))
-                        })
-                    });
-                    let (result, consumed) = match result {
-                        Ok(result) => result,
-                        Err(error) => {
-                            diagnostics.dtls_read_other.fetch_add(1, Ordering::Relaxed);
-                            active.store(false, Ordering::Release);
-                            let _ = errors.send(error);
-                            tun_write_queue.close();
-                            return;
-                        }
-                    };
-                    made_progress |= consumed;
-                    match result {
-                        DtlsIoResult::Complete(count) if count > 0 => {
-                            drain_pending = true;
-                            made_progress = true;
-                            progress.notify();
+                if drain {
+                    match panic_gate("client DTLS read worker", || {
+                        dtls.with(|dtls| dtls.read_status(&mut plain))
+                    }) {
+                        Ok(DtlsIoResult::Complete(n)) if n > 0 => {
                             diagnostics.dtls_read_ok.fetch_add(1, Ordering::Relaxed);
                             *activity
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
-                            if is_keepalive_packet(&packet[..count]) {
-                                continue;
+                            if !is_keepalive_packet(&plain[..n]) {
+                                if ipv4_packet_addresses(&plain[..n]).is_some() {
+                                    if tun_write_queue.push(plain[..n].to_vec()).is_err() {
+                                        return;
+                                    }
+                                } else {
+                                    eprintln!("[client] malformed IPv4 packet from server dropped");
+                                }
                             }
-                            if ipv4_packet_addresses(&packet[..count]).is_none() {
-                                eprintln!("[client] malformed IPv4 packet from server dropped");
-                                continue;
-                            }
-                            if tun_write_queue.push(packet[..count].to_vec()).is_err() {
-                                return;
-                            }
+                            continue;
                         }
-                        DtlsIoResult::Complete(_) | DtlsIoResult::WantRead => {
+                        Ok(DtlsIoResult::WantRead | DtlsIoResult::Complete(_)) => {
                             diagnostics
                                 .dtls_read_want_read
                                 .fetch_add(1, Ordering::Relaxed);
-                            drain_pending = false;
+                            drain = false;
                             progress.notify();
-                            if !consumed {
-                                break;
-                            }
                         }
-                        DtlsIoResult::WantWrite => {
+                        Ok(DtlsIoResult::WantWrite) => {
                             diagnostics
                                 .dtls_read_want_write
                                 .fetch_add(1, Ordering::Relaxed);
-                            drain_pending = true;
-                            if !consumed {
-                                break;
-                            }
+                            progress.wait(observed);
+                            continue;
+                        }
+                        Err(error) => {
+                            diagnostics.dtls_read_other.fetch_add(1, Ordering::Relaxed);
+                            active.store(false, Ordering::Release);
+                            let _ = errors.send(error);
+                            return;
                         }
                     }
                 }
-                if !made_progress {
-                    thread::yield_now();
+                if pending.is_none() {
+                    match queue.try_pop() {
+                        Ok(packet) => pending = Some(packet),
+                        Err(TryPopError::Closed) => break,
+                        Err(TryPopError::Empty) => {
+                            progress.wait(observed);
+                            continue;
+                        }
+                    }
+                }
+                let packet = pending.as_ref().expect("pending DTLS datagram");
+                match panic_gate("client DTLS inject worker", || {
+                    dtls.with(|dtls| dtls.inject(packet))
+                }) {
+                    Ok(true) => {
+                        pending = None;
+                        drain = true;
+                    }
+                    Ok(false) => {
+                        drain = true;
+                    }
+                    Err(error) => {
+                        diagnostics.dtls_read_other.fetch_add(1, Ordering::Relaxed);
+                        active.store(false, Ordering::Release);
+                        let _ = errors.send(error);
+                        return;
+                    }
                 }
             }
         })

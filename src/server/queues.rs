@@ -4,7 +4,6 @@ use std::{io, sync::Arc};
 
 pub(super) struct ServerQueues {
     pub(super) udp_rx_queue: Arc<Queue<UdpDatagram>>,
-    pub(super) tun_write_queue: Arc<Queue<Vec<u8>>>,
     pub(super) tun_read_queue: Arc<Queue<Vec<u8>>>,
 }
 
@@ -12,14 +11,12 @@ impl ServerQueues {
     pub(super) fn new() -> io::Result<Self> {
         Ok(Self {
             udp_rx_queue: new_queue()?,
-            tun_write_queue: new_queue()?,
             tun_read_queue: new_queue()?,
         })
     }
 
     pub(super) fn close(&self) {
         self.udp_rx_queue.close();
-        self.tun_write_queue.close();
         self.tun_read_queue.close();
     }
 }

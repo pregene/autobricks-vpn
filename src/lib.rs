@@ -399,6 +399,8 @@ extern "C" {
     fn wolfSSL_accept(ssl: *mut WolfSsl) -> c_int;
     fn wolfSSL_connect(ssl: *mut WolfSsl) -> c_int;
     fn wolfSSL_read(ssl: *mut WolfSsl, buffer: *mut c_void, size: c_int) -> c_int;
+    fn wolfSSL_inject(ssl: *mut WolfSsl, data: *const c_void, size: c_int) -> c_int;
+    fn wolfSSL_SSLDisableRead(ssl: *mut WolfSsl);
     fn wolfSSL_write(ssl: *mut WolfSsl, buffer: *const c_void, size: c_int) -> c_int;
     fn wolfSSL_get_error(ssl: *mut WolfSsl, ret: c_int) -> c_int;
     fn wolfSSL_get_peer_certificate(ssl: *mut WolfSsl) -> *mut WolfX509;
@@ -876,6 +878,25 @@ impl Dtls {
                 _ => Err(io::Error::other(format!("wolfSSL read failed: {error}"))),
             }
         }
+    }
+
+    /// Supply one encrypted datagram to an externally demultiplexed session.
+    /// APP_DATA_READY means the existing plaintext must be read before retrying
+    /// this same datagram; the caller still owns it.
+    pub fn inject(&mut self, packet: &[u8]) -> io::Result<bool> {
+        let size = c_int::try_from(packet.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "DTLS datagram is too large")
+        })?;
+        let result = unsafe { wolfSSL_inject(self.ssl, packet.as_ptr().cast(), size) };
+        match result {
+            SUCCESS => Ok(true),
+            -441 => Ok(false), // wolfSSL APP_DATA_READY
+            _ => Err(io::Error::other(format!("wolfSSL inject failed: {result}"))),
+        }
+    }
+
+    pub fn disable_callback_receive(&mut self) {
+        unsafe { wolfSSL_SSLDisableRead(self.ssl) };
     }
 
     pub fn last_read_error_code(&self) -> c_int {

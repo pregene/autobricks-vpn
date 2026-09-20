@@ -27,7 +27,6 @@ const SERVER_LIVENESS_TIMEOUT: Duration = Duration::from_secs(23);
 const HEALTH_PROBE_INTERVAL: Duration = Duration::from_secs(20);
 const HEALTH_PROBE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const RETRY_DELAY: Duration = Duration::from_secs(3);
-const DTLS_READ_DRAIN_LIMIT: usize = 4096;
 
 #[derive(Default)]
 pub(super) struct ClientDiagnostics {
@@ -208,8 +207,8 @@ fn run_connection(
     let encrypted_queue = Arc::clone(&queues.encrypted_rx);
     let plain_queue = Arc::clone(&queues.raw_tx);
     let keepalive_interval = effective_keepalive_interval(keepalive_interval);
-    // The receive callback commits a datagram only when wolfSSL actually reads it.
-    dtls.use_shared_receive_queue(Arc::clone(&encrypted_queue))?;
+    // Established-session datagrams are supplied by the decrypt worker via inject().
+    dtls.disable_callback_receive();
     let udp_write_progress = Arc::new(WorkerSignal::new());
     dtls.use_queued_send(Arc::clone(&queues.enc_tx), Arc::clone(&udp_write_progress))?;
     let dtls = Arc::new(SynchronizedDtls::new(dtls));

@@ -1,5 +1,6 @@
 use super::control::ControlWake;
 use autobricks_vpn::{base::queue::Queue, EncryptedDatagram, SynchronizedDtls};
+use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -15,6 +16,8 @@ pub(super) struct Session {
     pub(super) last_activity: Instant,
     pub(super) dtls_deadline: Option<Instant>,
     pub(super) drain_pending: bool,
+    /// Only used when wolfSSL reports APP_DATA_READY before it can accept a new datagram.
+    pub(super) pending_inject: VecDeque<Vec<u8>>,
     pub(super) bytes_tx: u64,
     pub(super) bytes_rx: u64,
     pub(super) packets_tx: u64,

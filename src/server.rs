@@ -17,7 +17,6 @@ use std::os::windows::io::AsRawSocket;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
 mod control;
@@ -30,7 +29,6 @@ use udp_write::drain_encrypted_queue;
 mod session;
 mod socket;
 mod tun_read;
-mod tun_write;
 mod udp_read;
 use control::ControlSocket;
 use session::Session;
@@ -235,8 +233,8 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
     let dtls_progress = Arc::new(WorkerSignal::new());
     let retry_requested = Arc::new(AtomicBool::new(false));
     let active = Arc::new(AtomicBool::new(true));
-    let encrypted_drops = Arc::new(AtomicU64::new(0));
     let plain_drops = Arc::new(AtomicU64::new(0));
+    let encrypted_drops = Arc::new(AtomicU64::new(0));
     let (error_sender, error_receiver) = mpsc::channel::<io::Error>();
     let (reload_sender, reload_receiver) = mpsc::channel();
 
@@ -245,12 +243,6 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
         Arc::clone(&tun_read_queue),
         Arc::clone(&active),
         Arc::clone(&plain_drops),
-        error_sender.clone(),
-    )?;
-    let tun_writer = tun_write::spawn_tun_writer(
-        Arc::clone(&tun),
-        Arc::clone(&queues.tun_write_queue),
-        Arc::clone(&active),
         error_sender.clone(),
     )?;
 
@@ -280,15 +272,15 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
         "Rust multi-client VPN hub listening on {listen}:{port} through {}",
         tun.name()
     );
-    let udp_read_queue = Arc::clone(&udp_rx_queue);
-    let udp_read_active = Arc::clone(&active);
-    let udp_read_progress = Arc::clone(&dtls_progress);
-    let tun_write_queue = Arc::clone(&queues.tun_write_queue);
     let cleanup_active = Arc::clone(&active);
     let cleanup_progress = Arc::clone(&dtls_progress);
     let cleanup_control_wake = Arc::clone(&control_wake);
+    let udp_read_queue = Arc::clone(&udp_rx_queue);
+    let udp_read_active = Arc::clone(&active);
+    let udp_read_progress = Arc::clone(&dtls_progress);
     let path = path.to_owned();
     let control_worker = control::spawn(control::ControlContext {
+        udp_rx_queue: Arc::clone(&udp_rx_queue),
         control,
         sessions: Arc::clone(&sessions),
         path: path.clone(),
@@ -303,7 +295,6 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
         max_session_lifetime,
         active: Arc::clone(&active),
         reload_sender,
-        udp_rx_queue: Arc::clone(&udp_rx_queue),
     })?;
     let decrypt_worker = decrypt::spawn(decrypt::DecryptContext {
         fd,
@@ -320,8 +311,8 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
         allow_multicast,
         network_address,
         network_prefix,
+        tun: Arc::clone(&tun),
         udp_rx_queue,
-        tun_write_queue,
         tun_read_queue: Arc::clone(&tun_read_queue),
         active,
         dtls_progress,
@@ -330,7 +321,6 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
         error_receiver,
         reload_receiver,
     })?;
-
     let read_result = udp_read::run(
         fd,
         udp_read_queue,
@@ -357,15 +347,10 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
     let tun_read_result = tun_reader
         .join()
         .map_err(|_| io::Error::other("TUN read worker panicked"));
-    let tun_write_result = tun_writer
-        .join()
-        .map_err(|_| io::Error::other("TUN write worker panicked"));
-    let encrypted_drops = encrypted_drops.load(Ordering::Relaxed);
     let plain_drops = plain_drops.load(Ordering::Relaxed);
-    if encrypted_drops > 0 || plain_drops > 0 {
-        eprintln!(
-            "[server] queue overflow drops: encrypted_rx={encrypted_drops}, plain_tx={plain_drops}"
-        );
+    let encrypted_drops = encrypted_drops.load(Ordering::Relaxed);
+    if plain_drops > 0 || encrypted_drops > 0 {
+        eprintln!("[server] queue overflow drops: udp_rx={encrypted_drops}, tun_rx={plain_drops}");
     }
     eprintln!("[server] shutting down; client forwarding rule removed");
     read_result
@@ -374,7 +359,6 @@ pub(crate) fn run(path: &str) -> io::Result<()> {
         .and(encrypt_result)
         .and(udp_write_result)
         .and(tun_read_result)
-        .and(tun_write_result)
 }
 
 #[cfg(test)]

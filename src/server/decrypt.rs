@@ -1,5 +1,37 @@
 use super::*;
 use autobricks_vpn::base::queue::TryPopError;
+use std::thread;
+
+fn write_tun_packet(tun: &Tun, packet: &[u8], active: &AtomicBool) -> io::Result<()> {
+    while RUNNING.load(Ordering::Acquire) && active.load(Ordering::Acquire) {
+        match tun.write_packet(packet) {
+            Ok(written) if written == packet.len() => return Ok(()),
+            Ok(written) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!("partial TUN write: {written}/{}", packet.len()),
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                let mut descriptor = libc::pollfd {
+                    fd: tun.fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                poll(
+                    std::slice::from_mut(&mut descriptor),
+                    Duration::from_millis(100),
+                )?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::Interrupted,
+        "server stopping",
+    ))
+}
 pub(super) fn create_stateless_acceptor(
     fd: RawFd,
     config: &Config,
@@ -31,8 +63,8 @@ pub(super) struct DecryptContext {
     pub(super) allow_multicast: bool,
     pub(super) network_address: Ipv4Addr,
     pub(super) network_prefix: u8,
+    pub(super) tun: Arc<Tun>,
     pub(super) udp_rx_queue: Arc<Queue<UdpDatagram>>,
-    pub(super) tun_write_queue: Arc<Queue<Vec<u8>>>,
     pub(super) tun_read_queue: Arc<Queue<Vec<u8>>>,
     pub(super) active: Arc<AtomicBool>,
     pub(super) dtls_progress: Arc<WorkerSignal>,
@@ -67,8 +99,8 @@ fn run(context: DecryptContext) -> io::Result<()> {
         allow_multicast,
         network_address,
         network_prefix,
+        tun,
         udp_rx_queue,
-        tun_write_queue,
         tun_read_queue,
         active,
         dtls_progress,
@@ -85,24 +117,18 @@ fn run(context: DecryptContext) -> io::Result<()> {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             for session in sessions.iter_mut().filter(|session| session.established) {
-                let queued = session.dtls.with(|dtls| dtls.queued_incoming_len());
-                if queued == 0 && !session.drain_pending {
+                if !session.drain_pending && session.pending_inject.is_empty() {
                     continue;
                 }
                 let mut packet = [0u8; 2048];
                 let read_result = panic_gate("client DTLS read", || {
-                    session.dtls.with(|dtls| {
-                        let before = dtls.receive_callback_stats().0;
-                        let result = dtls.read_status(&mut packet);
-                        let consumed = dtls.receive_callback_stats().0 > before;
-                        result.map(|status| (status, consumed))
-                    })
+                    session.dtls.with(|dtls| dtls.read_status(&mut packet))
                 });
                 dtls_progress.notify();
                 retry_requested.store(true, Ordering::Release);
                 tun_read_queue.notify_change();
                 match read_result {
-                    Ok((DtlsIoResult::Complete(count), _)) if count > 0 => {
+                    Ok(DtlsIoResult::Complete(count)) if count > 0 => {
                         session.drain_pending = true;
                         if is_keepalive_packet(&packet[..count]) {
                             session.last_activity = Instant::now();
@@ -121,20 +147,21 @@ fn run(context: DecryptContext) -> io::Result<()> {
                             if source == session.address && destination_allowed {
                                 session.bytes_rx = session.bytes_rx.saturating_add(count as u64);
                                 session.packets_rx = session.packets_rx.saturating_add(1);
-                                match tun_write_queue.push(packet[..count].to_vec()) {
-                                    Ok(Some(_)) => eprintln!(
-                                        "[server] TUN write queue overflow; oldest packet dropped"
-                                    ),
-                                    Ok(None) => session.last_activity = Instant::now(),
-                                    Err(_) => break 'server,
+                                match write_tun_packet(&tun, &packet[..count], &active) {
+                                    Ok(()) => session.last_activity = Instant::now(),
+                                    Err(error) => {
+                                        eprintln!("[server] TUN write failed: {error}");
+                                        result = Err(error);
+                                        break 'server;
+                                    }
                                 }
                             }
                         }
                     }
-                    Ok((DtlsIoResult::WantRead | DtlsIoResult::Complete(_), _)) => {
+                    Ok(DtlsIoResult::WantRead | DtlsIoResult::Complete(_)) => {
                         session.drain_pending = false;
                     }
-                    Ok((DtlsIoResult::WantWrite, _)) => {
+                    Ok(DtlsIoResult::WantWrite) => {
                         session.drain_pending = true;
                     }
                     Err(error) => {
@@ -142,11 +169,22 @@ fn run(context: DecryptContext) -> io::Result<()> {
                         eprintln!("[server] client DTLS read failed: {error}; retaining session until timeout");
                     }
                 }
+                if let Some(front) = session.pending_inject.front() {
+                    match session.dtls.with(|dtls| dtls.inject(front)) {
+                        Ok(true) => {
+                            session.pending_inject.pop_front();
+                            session.drain_pending = true;
+                        }
+                        Ok(false) => session.drain_pending = true,
+                        Err(error) => {
+                            eprintln!("[server] pending DTLS inject failed: {error}");
+                            session.pending_inject.pop_front();
+                        }
+                    }
+                }
             }
             sessions.iter().any(|session| {
-                session.established
-                    && (session.drain_pending
-                        || session.dtls.with(|dtls| dtls.queued_incoming_len() > 0))
+                session.established && (session.drain_pending || !session.pending_inject.is_empty())
             })
         };
         handshake_limiter.purge(Instant::now());
@@ -300,6 +338,7 @@ fn run(context: DecryptContext) -> io::Result<()> {
                         last_activity: Instant::now(),
                         dtls_deadline: None,
                         drain_pending: false,
+                        pending_inject: std::collections::VecDeque::new(),
                         bytes_tx: 0,
                         bytes_rx: 0,
                         packets_tx: 0,
@@ -320,10 +359,26 @@ fn run(context: DecryptContext) -> io::Result<()> {
                 .count();
             let session = &mut sessions[index];
             if !new_session {
-                if let Err(error) = session.dtls.with(|dtls| dtls.push_incoming(incoming)) {
-                    eprintln!("[server] unable to queue client datagram: {error}");
-                    sessions.swap_remove(index);
-                    continue;
+                if !session.pending_inject.is_empty() {
+                    if session.pending_inject.len() >= SESSION_TX_QUEUE_CAPACITY {
+                        eprintln!(
+                            "[server] pending DTLS inject limit reached; dropping newest datagram"
+                        );
+                    } else {
+                        session.pending_inject.push_back(incoming);
+                    }
+                } else {
+                    match session.dtls.with(|dtls| dtls.inject(&incoming)) {
+                        Ok(true) => session.drain_pending = true,
+                        Ok(false) => {
+                            session.pending_inject.push_back(incoming);
+                            session.drain_pending = true;
+                        }
+                        Err(error) => {
+                            eprintln!("[server] unable to inject client datagram: {error}");
+                            continue;
+                        }
+                    }
                 }
             }
             if !session.established {
@@ -382,6 +437,7 @@ fn run(context: DecryptContext) -> io::Result<()> {
                     session.address = *address;
                     session.fingerprint = Some(fingerprint.clone());
                     session.established = true;
+                    session.dtls.with(|dtls| dtls.disable_callback_receive());
                     session.established_at = Some(Instant::now());
                     session.dtls_deadline = None;
                     control_wake.notify();
