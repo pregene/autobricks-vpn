@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+. /usr/share/debconf/confmodule
+
+if [ -f /etc/autobricks-vpn/server.ini ]; then
+    exit 0
+fi
+
+for question in public-ip vpn-network vpn-address port country state locality organization organizational-unit root-ca-cn intermediate-ca-cn server-cn; do
+    db_input critical "autobricks-vpn/$question" || true
+done
+db_go
+db_input critical autobricks-vpn/confirm || true
+db_go

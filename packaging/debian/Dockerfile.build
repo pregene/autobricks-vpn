@@ -1,0 +1,19 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates git build-essential autoconf automake libtool \
+        pkg-config patchelf cargo rustc \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 --branch v5.8.2-stable https://github.com/wolfSSL/wolfssl.git /wolfssl \
+    && cd /wolfssl \
+    && ./autogen.sh \
+    && mkdir /wolfssl-build /wolfssl-install \
+    && cd /wolfssl-build \
+    && /wolfssl/configure --prefix=/wolfssl-install \
+        --enable-dtls --enable-dtls13 --enable-dtls-mtu \
+        --enable-crl --enable-ocsp --enable-opensslextra --enable-ip-alt-name \
+    && make -j2 \
+    && make install

@@ -1,0 +1,22 @@
+[Unit]
+Description=Autobricks VPN Web Console
+After=network.target autobricks-vpn.service
+Requires=autobricks-vpn.service
+StartLimitIntervalSec=infinity
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=autobricks
+Group=autobricks
+WorkingDirectory=/opt/autobricks-vpn/web
+Environment=NODE_ENV=production
+Environment=VPN_CONFIG=/etc/autobricks-vpn/server.ini
+Environment=VPN_DATA_DIR=/var/lib/autobricks-vpn
+ExecStart=/usr/bin/node /opt/autobricks-vpn/web/src/server.js
+Restart=on-failure
+RestartSec=0
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

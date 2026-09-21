@@ -1,0 +1,27 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = purge ] && [ -f /usr/share/debconf/confmodule ]; then
+    . /usr/share/debconf/confmodule
+fi
+
+if [ "$1" = remove ] || [ "$1" = purge ]; then
+    systemctl disable autobricks-vpn-web.service autobricks-vpn.service >/dev/null 2>&1 || true
+    systemctl daemon-reload || true
+fi
+
+if [ "$1" = purge ]; then
+    echo "Removing server configuration, certificates, Root CA private key, and web data."
+    rm -rf -- /etc/autobricks-vpn /var/lib/autobricks-vpn
+    if getent passwd autobricks >/dev/null; then
+        deluser --system autobricks >/dev/null 2>&1 || true
+    fi
+    if getent group autobricks >/dev/null; then
+        delgroup --system autobricks >/dev/null 2>&1 || true
+    fi
+    if command -v db_purge >/dev/null 2>&1; then
+        db_purge || true
+    fi
+fi
+
+exit 0

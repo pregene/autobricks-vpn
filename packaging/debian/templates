@@ -1,0 +1,69 @@
+Template: autobricks-vpn/public-ip
+Type: string
+Description: Public IPv4 address:
+ Enter the public IPv4 address included in the server certificate IP SAN.
+
+Template: autobricks-vpn/vpn-network
+Type: string
+Default: 10.9.1.0/24
+Description: VPN network:
+ Enter a canonical IPv4 CIDR used by VPN clients.
+
+Template: autobricks-vpn/vpn-address
+Type: string
+Default: 10.9.1.1
+Description: VPN server address:
+ Enter a usable host address inside the VPN network.
+
+Template: autobricks-vpn/port
+Type: string
+Default: 4433
+Description: VPN UDP and management web TCP port:
+ The VPN server uses UDP and the local management web uses TCP on this port.
+
+Template: autobricks-vpn/country
+Type: string
+Default: KR
+Description: Certificate country code:
+ Enter exactly two ASCII letters.
+
+Template: autobricks-vpn/state
+Type: string
+Default: Seoul
+Description: Certificate state or province:
+
+Template: autobricks-vpn/locality
+Type: string
+Default: Seoul
+Description: Certificate locality or city:
+
+Template: autobricks-vpn/organization
+Type: string
+Default: Autobricks
+Description: Certificate organization:
+
+Template: autobricks-vpn/organizational-unit
+Type: string
+Default: VPN
+Description: Certificate organizational unit:
+
+Template: autobricks-vpn/root-ca-cn
+Type: string
+Default: Autobricks VPN Root CA
+Description: Root CA common name:
+
+Template: autobricks-vpn/intermediate-ca-cn
+Type: string
+Default: Autobricks VPN Intermediate CA
+Description: Intermediate CA common name:
+
+Template: autobricks-vpn/server-cn
+Type: string
+Default: Autobricks VPN Server
+Description: Server certificate common name:
+
+Template: autobricks-vpn/confirm
+Type: boolean
+Default: true
+Description: Continue with this configuration?
+ Select No to stop before certificates or configuration are created.

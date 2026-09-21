@@ -95,7 +95,7 @@ flowchart LR
 
 ## 개발환경 구성
 
-운영 서버는 `./build.sh`(또는 `./build.sh --release`)로 `bin/`을 만든 뒤 `./install.sh`로 설치합니다. 인증서 생성과 서비스 등록 절차는 [INSTALL.md](INSTALL.md)를 참고합니다.
+Ubuntu 22.04 운영 서버는 Release의 DEB 패키지로 설치할 수 있습니다. 소스 빌드 설치, DEB 설치, 인증서 생성과 서비스 등록 절차는 [INSTALL.md](INSTALL.md)를 참고합니다. DEB 생성 절차는 [packaging/debian/README.md](packaging/debian/README.md)에 정리했습니다.
 
 ### 공통 요구사항
 
@@ -217,7 +217,7 @@ chmod 600 certs/*-key.pem
 | Ubuntu 22.04.5 LTS, x86_64, wolfSSL 5.9.1 | Ubuntu 22.04.4 LTS, x86_64 | DTLS 1.3 상호 인증, 인증서 fingerprint/SAN 기반 VPN IP 할당, TUN/MTU 1350, NAT·UDP 포트포워딩 경유 연결, ICMP, TCP/HTTP, VPN DNS, 클라이언트 간 통신 | 성공 |
 | Ubuntu 22.04.5 LTS, x86_64, GitHub Release 0.8.107 | Ubuntu 22.04.4 LTS, x86_64, 0.8.107 | 동봉 wolfSSL 로딩, DTLS 연결, TUN/MTU 1350, ICMP 및 SSH, 웹 실시간 연결 상태 | 성공 (2026-09-22) |
 | macOS 14.6.1, arm64, Rust 1.97.1, wolfSSL 5.9.1 | Ubuntu 22.04.4 LTS, x86_64 | DTLS 1.3 상호 인증, 인증서 fingerprint/SAN 기반 VPN IP 할당, utun/MTU 1350, NAT·UDP 포트포워딩 경유 연결, ICMP, TCP/HTTP, VPN DNS, Linux 클라이언트 접속 | 성공 |
-| Windows | Ubuntu Linux | Wintun 생성, DTLS 연결, 인증서 검증, VPN route 및 실제 터널 통신 | 미검증 (테스트 예정) |
+| Windows x86_64, GitHub Release 0.8.107 | Ubuntu 22.04.4 LTS, x86_64, 0.8.107 | Wintun 생성, DTLS 연결, 인증서 검증, VPN route 및 실제 터널 통신 | 성공 (2026-09-21) |
 | Windows x64/MSVC | macOS, 10.10.254.202 | Wintun, DTLS 연결·CA 인증, 10.9.1.3 → 10.9.1.1 ICMP, Ctrl+C 정상 종료와 경로 복구 | 성공: 안정화 후 8/8 응답, 손실 0%. SSH 연결도 사용자 확인([상세](RESULT.md)). SAN 검증·강제 DNS·처리량·재접속은 별도 시험 |
 
 위 표의 성공은 빌드 또는 단위 테스트만의 결과가 아니라 실제 서버와 클라이언트를 실행해 터널 트래픽을 확인한 결과입니다. Windows 클라이언트는 macOS 서버와 실제 접속을 검증했습니다. Windows 서버는 개발·지원하지 않습니다. 상세 결과는 [RESULT.md](RESULT.md), Windows 절차는 [WINDOWS.md](WINDOWS.md)를 참고합니다.

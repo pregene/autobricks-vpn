@@ -3,7 +3,6 @@
 target/
 /bin/
 /dependens/
-/packaging/
 /client-package/
 /web/data/
 

@@ -1,5 +1,40 @@
 # Autobricks VPN 서버 설치
 
+## Ubuntu 22.04 DEB 설치
+
+GitHub Release에서 서버 아키텍처에 맞는 `amd64` 또는 `arm64` DEB와 동일한
+이름의 `.sha256` 파일을 내려받습니다.
+
+```sh
+sha256sum -c autobricks-vpn-server-0.8.107-ubunbtu-22.04-ARCH.deb.sha256
+sudo dpkg -i autobricks-vpn-server-0.8.107-ubunbtu-22.04-ARCH.deb
+```
+
+최초 설치는 공개 IPv4, VPN 대역·서버 주소·포트, 인증서 국가·지역·조직 및
+Root CA·Intermediate CA·서버 CN을 영어로 입력받습니다. Root CA,
+Intermediate CA, 서버 인증서와 `/etc/autobricks-vpn/server.ini`를 생성하고
+`autobricks-vpn.service`, `autobricks-vpn-web.service`를 등록합니다. Root CA
+개인키 `/etc/autobricks-vpn/root-private/root-ca-key.pem`은 반드시 별도
+보관합니다.
+
+VPN 서비스에는 Node.js가 필요하지 않습니다. 관리 웹은 Node.js 18 이상이
+필요하며 Ubuntu 22.04에서는 Node.js 22 LTS를 권장합니다.
+
+```sh
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt-get install -y nodejs
+node --version
+sudo systemctl reset-failed autobricks-vpn-web.service
+sudo systemctl restart autobricks-vpn-web.service
+```
+
+DEB 빌드와 설치·삭제 동작의 상세 내용은
+[`packaging/debian/README.md`](packaging/debian/README.md)를 참고합니다.
+
+## 소스 빌드 설치
+
 macOS와 Linux 서버는 저장소 최상위에서 **빌드한 뒤 설치**합니다. Windows 서버는 지원하지 않습니다.
 
 ```sh

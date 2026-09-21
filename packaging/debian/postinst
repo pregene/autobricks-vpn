@@ -1,0 +1,86 @@
+#!/bin/sh
+set -e
+
+. /usr/share/debconf/confmodule
+
+if ! getent group autobricks >/dev/null; then
+    addgroup --system autobricks
+fi
+if ! getent passwd autobricks >/dev/null; then
+    adduser --system --ingroup autobricks --no-create-home --home /nonexistent --shell /usr/sbin/nologin autobricks
+fi
+
+install -d -o root -g autobricks -m 0770 /etc/autobricks-vpn
+install -d -o autobricks -g autobricks -m 0700 /var/lib/autobricks-vpn
+
+if [ ! -f /etc/autobricks-vpn/server.ini ]; then
+    db_get autobricks-vpn/confirm
+    if [ "$RET" != true ]; then
+        echo "Installation stopped before server configuration was created." >&2
+        exit 1
+    fi
+    db_get autobricks-vpn/public-ip; PUBLIC_IP=$RET
+    db_get autobricks-vpn/vpn-network; VPN_NETWORK=$RET
+    db_get autobricks-vpn/vpn-address; VPN_ADDRESS=$RET
+    db_get autobricks-vpn/port; PORT=$RET
+    db_get autobricks-vpn/country; COUNTRY=$RET
+    db_get autobricks-vpn/state; STATE=$RET
+    db_get autobricks-vpn/locality; LOCALITY=$RET
+    db_get autobricks-vpn/organization; ORGANIZATION=$RET
+    db_get autobricks-vpn/organizational-unit; ORGANIZATIONAL_UNIT=$RET
+    db_get autobricks-vpn/root-ca-cn; ROOT_CA_CN=$RET
+    db_get autobricks-vpn/intermediate-ca-cn; INTERMEDIATE_CA_CN=$RET
+    db_get autobricks-vpn/server-cn; SERVER_CN=$RET
+    /opt/autobricks-vpn/scripts/configure-server.py \
+        --public-ip "$PUBLIC_IP" --vpn-network "$VPN_NETWORK" \
+        --vpn-address "$VPN_ADDRESS" --port "$PORT" \
+        --country "$COUNTRY" --state "$STATE" --locality "$LOCALITY" \
+        --organization "$ORGANIZATION" --organizational-unit "$ORGANIZATIONAL_UNIT" \
+        --root-ca-cn "$ROOT_CA_CN" --intermediate-ca-cn "$INTERMEDIATE_CA_CN" \
+        --server-cn "$SERVER_CN"
+else
+    /opt/autobricks-vpn/scripts/configure-server.py \
+        --public-ip 127.0.0.1 --vpn-network 10.9.1.0/24 \
+        --vpn-address 10.9.1.1 --port 4433 --country KR --state Seoul \
+        --locality Seoul --organization Autobricks --organizational-unit VPN \
+        --root-ca-cn "Autobricks VPN Root CA" \
+        --intermediate-ca-cn "Autobricks VPN Intermediate CA" \
+        --server-cn "Autobricks VPN Server"
+fi
+
+chown root:autobricks /etc/autobricks-vpn
+chmod 0770 /etc/autobricks-vpn
+chown autobricks:autobricks /etc/autobricks-vpn/server.ini
+chmod 0600 /etc/autobricks-vpn/server.ini
+chown root:autobricks /etc/autobricks-vpn/certs
+chmod 0750 /etc/autobricks-vpn/certs
+for file in root-ca-cert.pem intermediate-ca-cert.pem intermediate-ca-key.pem server-cert.pem trust-chain.pem; do
+    chown root:autobricks "/etc/autobricks-vpn/certs/$file"
+    chmod 0640 "/etc/autobricks-vpn/certs/$file"
+done
+chown root:root /etc/autobricks-vpn/certs/server-key.pem /etc/autobricks-vpn/root-private /etc/autobricks-vpn/root-private/root-ca-key.pem
+chmod 0600 /etc/autobricks-vpn/certs/server-key.pem /etc/autobricks-vpn/root-private/root-ca-key.pem
+chmod 0700 /etc/autobricks-vpn/root-private
+
+systemctl daemon-reload
+systemctl enable autobricks-vpn.service autobricks-vpn-web.service >/dev/null
+systemctl reset-failed autobricks-vpn.service autobricks-vpn-web.service || true
+if ! systemctl restart autobricks-vpn.service; then
+    echo "Autobricks VPN server failed to start. Check: journalctl -u autobricks-vpn.service" >&2
+    exit 1
+fi
+
+systemctl restart autobricks-vpn-web.service || true
+sleep 1
+if systemctl is-active --quiet autobricks-vpn-web.service; then
+    echo "Autobricks VPN server and management web are running."
+else
+    echo "WARNING: The VPN server is running, but the management web is not." >&2
+    echo "WARNING: Install Node.js 18 or later, then run:" >&2
+    echo "  systemctl reset-failed autobricks-vpn-web.service" >&2
+    echo "  systemctl restart autobricks-vpn-web.service" >&2
+fi
+
+echo "Root CA private key: /etc/autobricks-vpn/root-private/root-ca-key.pem"
+echo "Store an offline backup of the Root CA private key."
+db_stop

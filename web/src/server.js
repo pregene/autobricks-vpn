@@ -13,7 +13,10 @@ const settings = readServerSettings(configPath);
 const host = "127.0.0.1";
 const port = settings.port;
 const vpnControl = new VpnControl(settings.controlSocket);
-const activityLog = new ActivityLog(vpnControl, path.resolve(currentDirectory, "../data/activity.json"));
+const activityLog = new ActivityLog(
+  vpnControl,
+  path.resolve(process.env.VPN_DATA_DIR ?? path.join(currentDirectory, "../data"), "activity.json"),
+);
 
 if (!Number.isInteger(port) || port < 1 || port > 65535) {
   throw new Error("WEB_PORT must be an integer between 1 and 65535");

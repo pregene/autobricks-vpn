@@ -1,0 +1,15 @@
+[Unit]
+Description=Autobricks VPN Server
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=infinity
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/opt/autobricks-vpn/bin/vpn-server --config /etc/autobricks-vpn/server.ini
+Restart=on-failure
+RestartSec=0
+
+[Install]
+WantedBy=multi-user.target

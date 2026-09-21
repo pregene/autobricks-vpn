@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = remove ] || [ "$1" = upgrade ] || [ "$1" = deconfigure ]; then
+    systemctl stop autobricks-vpn-web.service autobricks-vpn.service || true
+fi
