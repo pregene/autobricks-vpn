@@ -14,8 +14,8 @@ Each DEB is accompanied by a `.sha256` file containing its SHA-256 checksum.
 Install the package interactively:
 
 ```sh
-sha256sum -c autobricks-vpn-server-0.8.107-ubunbtu-22.04-ARCH.deb.sha256
-sudo dpkg -i autobricks-vpn-server-0.8.107-ubunbtu-22.04-ARCH.deb
+sha256sum -c autobricks-vpn-server-0.8.108-ubunbtu-22.04-ARCH.deb.sha256
+sudo dpkg -i autobricks-vpn-server-0.8.108-ubunbtu-22.04-ARCH.deb
 ```
 
 The first installation asks for the certificate subject, public IPv4 address,
