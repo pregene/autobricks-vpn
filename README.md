@@ -36,7 +36,7 @@ Copyright © 2026 Autobricks.co.kr. All rights reserved.
 - 외부 인터넷 또는 외부 LAN 접속: VPN 내부 통신 전용입니다.
 - NAT/MASQUERADE 및 인터넷 default route 변경
 - split DNS 또는 fallback DNS: `force_dns = true`이면 모든 DNS 질의가 지정한 VPN DNS를 사용합니다.
-- Windows 서버
+- Windows 서버: 개발·지원 대상에서 제외합니다.
 - 모바일 roaming 또는 연결 중 UDP endpoint의 NAT rebinding: 연결이 끊기면 새 DTLS 세션으로 재접속합니다.
 - 무중단 기존 DTLS 세션의 인증서·키 교체: 최대 세션 수명 후 재접속하면서 새 인증 정보를 적용합니다.
 - 자동 CRL 다운로드: `crl_file`로 지정한 로컬 CRL을 사용합니다.
@@ -174,7 +174,7 @@ DTLS 1.3과 CRL/OCSP를 모두 같은 설정으로 검증하려면 공통 절의
 
 ### Windows 클라이언트 개발환경
 
-Windows는 클라이언트만 빌드할 수 있습니다. 다음 항목이 필요합니다.
+Windows는 클라이언트와 VPN DLL만 빌드합니다. 서버는 Linux/macOS에서 실행합니다. 전체 절차와 검증 범위는 [WINDOWS.md](WINDOWS.md)를 참고합니다. 다음 항목이 필요합니다.
 
 - Rust stable `x86_64-pc-windows-msvc` toolchain
 - Visual Studio Build Tools의 Desktop development with C++ workload
@@ -187,7 +187,7 @@ PowerShell에서 경로를 설정하고 빌드합니다.
 rustup default stable-x86_64-pc-windows-msvc
 $env:WOLFSSL_PREFIX = "C:\wolfssl"
 $env:WINTUN_DLL = "C:\path\to\wintun.dll"
-cargo build --bin vpn-client --features dtls13
+cargo build --lib --bin vpn-client --features dtls13
 Copy-Item $env:WINTUN_DLL target\debug\wintun.dll
 ```
 
@@ -202,6 +202,8 @@ cargo test --lib
 cargo clippy --all-targets --all-features
 ```
 
+위 전체 대상 검사는 Linux/macOS용입니다. Windows에서는 미지원 서버 대상을 제외하고 `cargo check --lib --bin vpn-client --all-features`, `cargo test --lib --bin vpn-client --features dtls13`, `cargo clippy --lib --bin vpn-client --all-features`를 사용합니다. 자동 빌드·시험은 `build.ps1 -Test`로 실행합니다.
+
 `cargo check`는 Rust 코드 검증만 수행할 수 있지만 실행 파일을 생성하는 `cargo build`와 실제 구동에는 wolfSSL library가 필요합니다. 테스트용 인증서 경로는 `certs/`이며 개인키는 Linux/macOS에서 소유자만 읽을 수 있도록 설정합니다.
 
 ```sh
@@ -215,10 +217,11 @@ chmod 600 certs/*-key.pem
 | Ubuntu 22.04.5 LTS, x86_64, wolfSSL 5.9.1 | Ubuntu 22.04.4 LTS, x86_64 | DTLS 1.3 상호 인증, 인증서 fingerprint/SAN 기반 VPN IP 할당, TUN/MTU 1350, NAT·UDP 포트포워딩 경유 연결, ICMP, TCP/HTTP, VPN DNS, 클라이언트 간 통신 | 성공 |
 | macOS 14.6.1, arm64, Rust 1.97.1, wolfSSL 5.9.1 | Ubuntu 22.04.4 LTS, x86_64 | DTLS 1.3 상호 인증, 인증서 fingerprint/SAN 기반 VPN IP 할당, utun/MTU 1350, NAT·UDP 포트포워딩 경유 연결, ICMP, TCP/HTTP, VPN DNS, Linux 클라이언트 접속 | 성공 |
 | Windows | Ubuntu Linux | Wintun 생성, DTLS 연결, 인증서 검증, VPN route 및 실제 터널 통신 | 미검증 (테스트 예정) |
+| Windows x64/MSVC | macOS, 10.10.254.202 | Wintun, DTLS 연결·CA 인증, 10.9.1.3 → 10.9.1.1 ICMP, Ctrl+C 정상 종료와 경로 복구 | 성공: 안정화 후 8/8 응답, 손실 0%. SSH 연결도 사용자 확인([상세](RESULT.md)). SAN 검증·강제 DNS·처리량·재접속은 별도 시험 |
 
-위 표의 성공은 빌드 또는 단위 테스트만의 결과가 아니라 실제 서버와 클라이언트를 실행해 터널 트래픽을 확인한 결과입니다. Windows 코드는 빌드 경로를 제공하지만 아직 실제 Windows 장비에서 검증하지 않았습니다.
+위 표의 성공은 빌드 또는 단위 테스트만의 결과가 아니라 실제 서버와 클라이언트를 실행해 터널 트래픽을 확인한 결과입니다. Windows 클라이언트는 macOS 서버와 실제 접속을 검증했습니다. Windows 서버는 개발·지원하지 않습니다. 상세 결과는 [RESULT.md](RESULT.md), Windows 절차는 [WINDOWS.md](WINDOWS.md)를 참고합니다.
 
-0.8.107 클라이언트 압축 파일은 [GitHub Release v0.8.107](https://github.com/pregene/autobricks-vpn/releases/tag/v0.8.107)에서 macOS ARM64·x86_64, Linux ARM64·x86_64 네 종류를 받을 수 있습니다. wolfSSL 공유 라이브러리를 각 압축 파일에 동봉했습니다. Linux는 Debian Bookworm의 glibc 2.36 환경에서 빌드했으며 Alpine은 대상이 아닙니다. Windows는 Rust 코드 컴파일 검사만 통과했고 실제 실행과 VPN 접속은 검증하지 않았습니다. 압축 파일의 내용, 실행 조건과 검증 범위는 [CLIENT.md](CLIENT.md)를 참고합니다.
+0.8.107 클라이언트 압축 파일은 [GitHub Release v0.8.107](https://github.com/pregene/autobricks-vpn/releases/tag/v0.8.107)에서 macOS ARM64·x86_64, Linux ARM64·x86_64, Windows x86_64 다섯 종류를 받을 수 있습니다. wolfSSL 공유 라이브러리를 각 압축 파일에 동봉했습니다. Linux는 Debian Bookworm의 glibc 2.36 환경에서 빌드했으며 Alpine은 대상이 아닙니다. Windows ZIP은 Release 빌드이며 로컬 재빌드는 `build.ps1 -Release -Test`를 사용합니다. 압축 파일의 내용, 실행 조건과 검증 범위는 [CLIENT.md](CLIENT.md)를 참고합니다.
 
 과거 결과를 포함한 성능 비교와 최적화 이력은 [PERFORMANCE.md](PERFORMANCE.md)에서 관리합니다.
 
@@ -263,6 +266,7 @@ target/debug/libautobricks_vpn.dylib
 Windows
 target/debug/vpn-client.exe
 target/debug/autobricks_vpn.dll
+target/debug/wolfssl.dll
 target/debug/wintun.dll
 ```
 
@@ -273,15 +277,15 @@ AUTOBRICKS_VPN_LIBRARY=/opt/autobricks/lib/libautobricks_vpn.so \
   /opt/autobricks/bin/vpn-server --config /etc/autobricks-vpn/server.ini
 ```
 
-서버는 Linux와 macOS만 지원합니다. Windows는 클라이언트만 지원하며 Wintun driver와 `wintun.dll`이 필요합니다. wolfSSL Windows 빌드 경로를 지정하고 Wintun DLL을 실행 파일 옆에 둔 뒤 실행합니다.
+Windows 클라이언트는 Wintun과 `wintun.dll`이 필요합니다. `build.ps1 -Test`는 wolfSSL과 Wintun을 준비하고 클라이언트 EXE와 필요한 DLL을 `bin/windows/debug/`에 배치합니다. Windows 서버는 빌드하지 않습니다. 수동 빌드에서는 다음과 같이 라이브러리도 함께 지정합니다.
 
 ```powershell
 $env:WOLFSSL_PREFIX = "C:\wolfssl"
 $env:WINTUN_DLL = "C:\path\to\wintun.dll"
-cargo build --bin vpn-client
+cargo build --lib --bin vpn-client --features dtls13
 ```
 
-Windows TUN adapter는 `wintun` crate로 생성하며 관리자 권한이 필요합니다. `netsh`와 `route`로 IPv4 주소 및 VPN route를 자동 설정합니다.
+Windows TUN adapter는 `wintun` crate로 생성하며 관리자 권한이 필요합니다. `netsh`로 IPv4 주소를 설정하면 연결된 VPN 서브넷 경로가 생성됩니다. 기본 게이트웨이는 추가하지 않습니다.
 
 ## API
 

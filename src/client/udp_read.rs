@@ -32,20 +32,47 @@ pub(super) fn wait_for_udp(socket: &UdpSocket, timeout: Duration) -> io::Result<
 #[cfg(windows)]
 pub(super) fn wait_for_udp(socket: &UdpSocket, timeout: Duration) -> io::Result<bool> {
     let deadline = Instant::now() + timeout;
-    let mut byte = [0u8; 1];
+    use crate::windows_socket::{poll, PollFd, POLLIN};
+    let mut descriptor = PollFd {
+        fd: socket_fd(socket),
+        events: POLLIN,
+        revents: 0,
+    };
     while RUNNING.load(Ordering::Relaxed) {
-        match socket.peek(&mut byte) {
-            Ok(_) => return Ok(true),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(error),
-        }
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        poll(
+            std::slice::from_mut(&mut descriptor),
+            remaining.min(Duration::from_millis(100)),
+        )?;
+        if descriptor.revents & POLLIN != 0 {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
             return Ok(false);
         }
-        thread::sleep(remaining.min(Duration::from_millis(10)));
     }
     Ok(false)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readiness_preserves_full_sized_datagram() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        assert!(!wait_for_udp(&receiver, Duration::ZERO).unwrap());
+        let packet = [42u8; 1350];
+        sender
+            .send_to(&packet, receiver.local_addr().unwrap())
+            .unwrap();
+        assert!(wait_for_udp(&receiver, Duration::from_secs(1)).unwrap());
+        let mut received = [0u8; 2048];
+        assert_eq!(receiver.recv(&mut received).unwrap(), packet.len());
+        assert_eq!(&received[..packet.len()], &packet);
+    }
 }
 
 pub(super) fn spawn(

@@ -2,6 +2,30 @@
 
 테스트 방법과 판정 기준: [TESTCASE.md](TESTCASE.md). 측정하지 않은 항목은 결과로 기록하지 않는다.
 
+## 2026-09-21 Windows 빌드 및 macOS 서버 접속
+
+이번 결과는 아래의 기존 성능 시험과 별개인 Windows 클라이언트 기능 확인이다. 제품 버전 표시는 0.8.107이며, Windows 클라이언트 수정이 포함된 작업 폴더를 빌드했다. Windows 서버는 개발·지원하지 않으며 서버는 Linux/macOS에서 실행한다.
+
+| 항목 | 결과 |
+|---|---|
+| 빌드 환경 | Windows x64, Rust 1.98.1 MSVC, MSVC 19.44, Windows SDK 10.0.26100.0, wolfSSL 5.8.2, Wintun 0.14.1 |
+| 산출물 | `bin/windows/debug/`, `bin/windows/release/`의 클라이언트 EXE, VPN DLL, wolfSSL DLL, Wintun DLL |
+| 단위 테스트 | 클라이언트 전용 debug/release 각각 35개 통과(라이브러리 31, 클라이언트 런처 4). 복사된 `config/client-b.ini`의 내장 인증서를 지정해 클라이언트 wolfSSL 초기화 시험도 수행 |
+| 회귀 컴파일 | Linux x86_64, macOS ARM64: `cargo check --all-targets --all-features` 통과. 해당 OS에서 재실행한 결과는 아님 |
+| 접속 설정 | 사용자가 수정한 `config/client-b.ini`; `10.10.254.202:4433/UDP`의 macOS 서버에 접속 |
+| 터널 | Windows `autobricks-b`, `10.9.1.3` → macOS `utun7`, `10.9.1.1`; MTU 1350 |
+| 인증·연결 | DTLS handshake와 클라이언트 연결 완료 로그 확인. CA 인증서 검증 사용. 실제 시험의 `verify_server_san_ip = false`이므로 SAN 주소 검증 성공으로 기록하지 않음 |
+| 최초 접속 후 ICMP | 4회 중 2회 응답, 첫 2회 시간 초과. 연결 직후 손실 원인은 확정하지 않음 |
+| 안정화 후 ICMP | 13:49 KST, 연결 후 5초 대기하고 8회 측정: 8/8 응답, 손실 0%, RTT 최소 8 / 최대 25 / 평균 20ms |
+| SSH/TCP | 사용자가 Windows 클라이언트 실행 후 SSH 연결 성공을 확인함. 접속 대상 주소·포트와 세션 로그는 별도로 수집하지 않았으며 처리량 측정 결과는 아님 |
+| 종료·경로 | Ctrl+C 정상 종료, 클라이언트 종료 코드 0. 시험 전후 IPv4 경로의 목적지·next hop·인터페이스·메트릭 비교에서 차이 없음 |
+| DNS | `force_dns = false`. DNS 강제 설정을 적용하지 않았으며 적용·복구는 미시험 |
+| 미시험 | TCP/UDP 처리량, 네트워크 단절 후 자동 재접속, SAN 검증 활성 상태의 실제 접속, 강제 DNS, 강제 종료 복구 |
+
+처음에는 관리자 권한이 없어 Wintun 생성이 실패했다. 관리자 실행 후에는 기존 1바이트 UDP `peek`가 Windows 소켓 오류 10040을 발생시켰다. 클라이언트의 대기 코드를 WSAPoll로 바꾸고 1350바이트 데이터그램 보존 회귀 테스트를 추가한 뒤 접속에 성공했다. 이 시험을 위해 macOS 방화벽을 해제하지 않았다.
+
+접속 시험 원본 로그: 로컬 `testdata/windows-client-20260921-134906/`의 `client.stderr.log`, `client.stdout.log`, `ping.txt`, `summary.txt`, `routes-before.csv`, `routes-after.csv`. 빌드 기록은 `dependens/windows-build.log`, `dependens/windows-release-build.log`다. 이 경로들은 Git에서 제외되며 인증서·개인키·INI도 커밋하지 않는다. 재현 절차는 [WINDOWS.md](WINDOWS.md)에 있다.
+
 ## 테스트 결과
 | 실행 일시 (KST) | 버전 | TC-01 | TC-02 | TC-03 | TC-04 | TC-05 | TC-06 | TC-07 | TC-08 | TC-09 | TC-10 | TC-11 | TC-12 |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|

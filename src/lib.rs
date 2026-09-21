@@ -21,6 +21,9 @@ pub mod base;
 mod client;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod server;
+#[cfg(windows)]
+#[path = "windows/socket.rs"]
+mod windows_socket;
 
 fn run_from_ffi(config_path: *const c_char, runner: impl FnOnce(&str) -> io::Result<()>) -> c_int {
     if config_path.is_null() {
@@ -1763,13 +1766,13 @@ impl Tun {
                     "static",
                     address,
                     &mask.to_string(),
-                    peer,
+                    "none",
+                    "store=active",
                 ],
             )?;
-            run_command(
-                "route",
-                &["ADD", network_address, "MASK", &mask.to_string(), peer],
-            )
+            // Windows installs the connected subnet route with the address.
+            // Do not add a default gateway or a duplicate route on reconnect.
+            Ok(())
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {

@@ -40,6 +40,6 @@ macOS ARM64·x86_64는 이 Mac에서 `--help` 실행과 VPN 라이브러리의 w
 
 ## Windows 클라이언트 상태
 
-Windows용 Wintun 장치, IPv4 주소·경로·DNS 설정, DTLS 클라이언트 경로는 코드에 있다. macOS에서 `cargo check --target x86_64-pc-windows-msvc --features dtls13 --bin vpn-client --lib`가 통과했다. 이는 Rust 코드의 컴파일 검사이며, MSVC용 wolfSSL을 연결한 실행 파일 빌드나 Windows에서의 실행을 뜻하지 않는다.
+Windows는 클라이언트만 개발·지원한다. x64/MSVC에서 wolfSSL DLL을 연결한 클라이언트와 VPN DLL의 실제 빌드 및 단위 테스트를 확인했다. `build.ps1 -Test`로 재현할 수 있다. Windows UDP 수신 준비는 `src/windows/socket.rs`의 WSAPoll을 사용한다. 1바이트 UDP peek가 Windows에서 오류 10040을 발생시키던 문제를 수정했다.
 
-Windows 패키지를 만들려면 같은 아키텍처와 MSVC ABI로 빌드한 wolfSSL 공유 라이브러리 및 Wintun DLL이 필요하다. Wintun 드라이버 설치, VPN 연결, 재접속, 경로와 DNS 복구는 실제 Windows PC 또는 VM에서 검증해야 한다. 이 Mac의 Docker는 Linux 컨테이너를 실행하므로 Wintun을 통한 Windows VPN 동작을 검증할 수 없다. 현재 Windows 배포 압축 파일은 없다.
+필요한 DLL은 빌드 스크립트가 실행 파일 옆에 배치한다. 관리자 권한 접속·재접속·경로와 DNS 복구는 빌드 검사와 구분한다. 실행 절차는 [WINDOWS.md](WINDOWS.md), 실제 접속 결과는 [RESULT.md](RESULT.md)에 기록한다. [GitHub Release v0.8.107](https://github.com/pregene/autobricks-vpn/releases/tag/v0.8.107)에 Windows x64 Release 빌드 `autobricks-vpn-0.8.107-windows-x86_64.zip`을 추가했다. ZIP에는 클라이언트 EXE, VPN·wolfSSL·Wintun DLL, 라이선스와 소스 스냅샷이 포함되며 인증서·개인키·INI는 포함하지 않는다.
