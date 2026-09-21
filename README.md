@@ -218,6 +218,8 @@ chmod 600 certs/*-key.pem
 
 위 표의 성공은 빌드 또는 단위 테스트만의 결과가 아니라 실제 서버와 클라이언트를 실행해 터널 트래픽을 확인한 결과입니다. Windows 코드는 빌드 경로를 제공하지만 아직 실제 Windows 장비에서 검증하지 않았습니다.
 
+0.8.107 클라이언트 압축 파일은 `client-package/`에 macOS ARM64·x86_64, Linux ARM64·x86_64 네 종류가 있습니다. wolfSSL 공유 라이브러리를 각 압축 파일에 동봉했습니다. Linux는 Debian Bookworm의 glibc 2.36 환경에서 빌드했으며 Alpine은 대상이 아닙니다. Windows는 Rust 코드 컴파일 검사만 통과했고 실제 실행과 VPN 접속은 검증하지 않았습니다. 압축 파일의 내용, 실행 조건과 검증 범위는 [CLIENT.md](CLIENT.md)를 참고합니다.
+
 과거 결과를 포함한 성능 비교와 최적화 이력은 [PERFORMANCE.md](PERFORMANCE.md)에서 관리합니다.
 
 ## Build
