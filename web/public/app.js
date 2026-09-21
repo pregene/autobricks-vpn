@@ -136,7 +136,7 @@ clientAddForm.addEventListener("submit", async (event) => {
     const response = await fetch("/api/clients/issue", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ name: input.name, vpnAddress, validityDays: Number(input.validityDays), loginId: input.loginId, password: input.password }),
+      body: JSON.stringify({ name: input.name, vpnAddress, allowedSourceCidr: input.allowedSourceCidr, validityDays: Number(input.validityDays), loginId: input.loginId, password: input.password }),
     });
     if (!response.ok) {
       const body = await response.json();

@@ -504,6 +504,33 @@ fn run(context: DecryptContext) -> io::Result<()> {
                             continue;
                         }
                     }
+                    let Some(source_ip) = peer_ipv4(&session.peer) else {
+                        eprintln!("[server] unable to determine client source IPv4 address");
+                        sessions.swap_remove(index);
+                        continue;
+                    };
+                    let source_allowed =
+                        match panic_gate("client source CIDR policy verification", || {
+                            session
+                                .dtls
+                                .with(|dtls| dtls.peer_certificate_allows_source_ip(source_ip))
+                        }) {
+                            Ok(allowed) => allowed,
+                            Err(error) => {
+                                eprintln!(
+                                    "[server] unable to verify client source CIDR policy: {error}"
+                                );
+                                sessions.swap_remove(index);
+                                continue;
+                            }
+                        };
+                    if !source_allowed {
+                        eprintln!(
+                            "[server] client source IP {source_ip} is outside the certificate policy"
+                        );
+                        sessions.swap_remove(index);
+                        continue;
+                    }
                     session.address = *address;
                     session.fingerprint = Some(fingerprint.clone());
                     session.established = true;

@@ -21,6 +21,32 @@ function pemSection(name, pem) {
   return `[${name}]\n${pem.trim()}\n`;
 }
 
+export function validateAllowedSourceCidr(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  const match = text.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/);
+  if (!match) throw bad("허용 접속 IP 대역은 IPv4 CIDR 형식으로 입력하세요.");
+  const octets = match.slice(1, 5).map(Number);
+  const prefix = Number(match[5]);
+  if (octets.some((octet) => octet > 255) || prefix > 32) {
+    throw bad("허용 접속 IP 대역은 IPv4 CIDR 형식으로 입력하세요.");
+  }
+  const address = octets.reduce((result, octet) => (result * 256 + octet) >>> 0, 0);
+  const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+  if ((address & mask) >>> 0 !== address) {
+    throw bad("허용 접속 IP 대역에는 host bit가 없는 네트워크 주소를 입력하세요.");
+  }
+  return `${octets.join(".")}/${prefix}`;
+}
+
+export function clientCertificateExtensions(vpnAddress, allowedSourceCidr) {
+  const names = [`IP.1=${vpnAddress}`];
+  if (allowedSourceCidr) {
+    names.push(`URI.1=urn:autobricks:allowed-source-cidr:${allowedSourceCidr}`);
+  }
+  return `basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth\nsubjectAltName=@client_names\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n\n[client_names]\n${names.join("\n")}\n`;
+}
+
 export class ClientIssuer {
   constructor(settings, configPath) {
     this.settings = settings;
@@ -49,6 +75,7 @@ export class ClientIssuer {
     const name = String(input.name ?? "").trim();
     if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/.test(name)) throw bad("클라이언트 이름은 영문, 숫자, 점, 밑줄, 하이픈으로 입력하세요.");
     const vpnAddress = validateClientAddress(input.vpnAddress, settings);
+    const allowedSourceCidr = validateAllowedSourceCidr(input.allowedSourceCidr);
     const validityDays = Number(input.validityDays ?? 365);
     if (!Number.isInteger(validityDays) || validityDays < 1 || validityDays > 825) throw bad("유효 기간은 1~825일이어야 합니다.");
 
@@ -87,7 +114,7 @@ export class ClientIssuer {
       fs.writeFileSync(intermediateKeyPath, intermediateKeyPem, { mode: 0o600 });
       const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 3072, privateKeyEncoding: { type: "pkcs8", format: "pem" }, publicKeyEncoding: { type: "spki", format: "pem" } });
       fs.writeFileSync(keyPath, privateKey, { mode: 0o600 });
-      fs.writeFileSync(extPath, `basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth\nsubjectAltName=IP:${vpnAddress}\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n`);
+      fs.writeFileSync(extPath, clientCertificateExtensions(vpnAddress, allowedSourceCidr));
       runOpenSsl(["req", "-new", "-key", keyPath, "-out", csrPath, "-subj", `/CN=${name}`]);
       runOpenSsl(["x509", "-req", "-in", csrPath, "-CA", intermediateCertPath, "-CAkey", intermediateKeyPath, "-set_serial", `0x${randomBytes(16).toString("hex")}`, "-days", String(validityDays), "-sha256", "-extfile", extPath, "-out", certPath]);
       const certificatePem = fs.readFileSync(certPath, "utf8");

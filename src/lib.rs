@@ -17,6 +17,36 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
 
+const ALLOWED_SOURCE_CIDR_URI_PREFIX: &str = "urn:autobricks:allowed-source-cidr:";
+
+fn certificate_source_policy_allows<'a>(
+    alt_names: impl IntoIterator<Item = &'a str>,
+    source: Ipv4Addr,
+) -> io::Result<bool> {
+    let mut policy = None;
+    for name in alt_names {
+        if !name.starts_with("urn:autobricks:") {
+            continue;
+        }
+        let Some(cidr) = name.strip_prefix(ALLOWED_SOURCE_CIDR_URI_PREFIX) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown client certificate policy URI: {name}"),
+            ));
+        };
+        if policy.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "client certificate contains multiple allowed source CIDR policies",
+            ));
+        }
+        policy = Some(parse_ipv4_cidr(cidr)?);
+    }
+    Ok(policy.map_or(true, |(network, prefix)| {
+        ipv4_in_cidr(source, network, prefix)
+    }))
+}
+
 pub mod base;
 mod client;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1007,6 +1037,37 @@ impl Dtls {
             }
             wolfSSL_X509_free(cert);
             Ok(matched)
+        }
+    }
+    pub fn peer_certificate_allows_source_ip(&self, source: Ipv4Addr) -> io::Result<bool> {
+        unsafe {
+            let cert = wolfSSL_get_peer_certificate(self.ssl);
+            if cert.is_null() {
+                return Err(io::Error::other("peer certificate unavailable"));
+            }
+            let result = (|| {
+                let mut alt_names = Vec::new();
+                loop {
+                    let name = wolfSSL_X509_get_next_altname(cert);
+                    if name.is_null() {
+                        break;
+                    }
+                    alt_names.push(
+                        CStr::from_ptr(name)
+                            .to_str()
+                            .map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "client certificate SAN is not valid UTF-8",
+                                )
+                            })?
+                            .to_owned(),
+                    );
+                }
+                certificate_source_policy_allows(alt_names.iter().map(String::as_str), source)
+            })();
+            wolfSSL_X509_free(cert);
+            result
         }
     }
     pub fn fd(&self) -> RawFd {
@@ -2100,9 +2161,9 @@ pub fn validate_client_bindings(
 #[cfg(test)]
 mod tests {
     use super::{
-        ipv4_in_cidr, ipv4_is_broadcast, ipv4_packet_addresses, normalize_sha256_fingerprint,
-        panic_gate, parse_ipv4_cidr, validate_client_bindings, validate_datagram_write,
-        validate_private_key_file, IpRateLimiter, RateLimitDecision,
+        certificate_source_policy_allows, ipv4_in_cidr, ipv4_is_broadcast, ipv4_packet_addresses,
+        normalize_sha256_fingerprint, panic_gate, parse_ipv4_cidr, validate_client_bindings,
+        validate_datagram_write, validate_private_key_file, IpRateLimiter, RateLimitDecision,
     };
     use std::io;
     use std::net::Ipv4Addr;
@@ -2188,6 +2249,44 @@ mod tests {
         assert!(ipv4_in_cidr("10.8.1.2".parse().unwrap(), network, prefix));
         assert!(!ipv4_in_cidr("10.8.2.2".parse().unwrap(), network, prefix));
         assert!(parse_ipv4_cidr("10.8.1.7/24").is_err());
+    }
+
+    #[test]
+    fn enforces_client_certificate_source_cidr_policy() {
+        let source: Ipv4Addr = "192.0.2.24".parse().unwrap();
+        assert!(certificate_source_policy_allows(["10.9.1.4"], source).unwrap());
+        assert!(certificate_source_policy_allows(
+            ["urn:autobricks:allowed-source-cidr:192.0.2.0/24"],
+            source,
+        )
+        .unwrap());
+        assert!(!certificate_source_policy_allows(
+            ["urn:autobricks:allowed-source-cidr:198.51.100.0/24"],
+            source,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn rejects_invalid_or_ambiguous_client_certificate_policies() {
+        let source: Ipv4Addr = "192.0.2.24".parse().unwrap();
+        assert!(certificate_source_policy_allows(
+            ["urn:autobricks:allowed-source-cidr:192.0.2.7/24"],
+            source,
+        )
+        .is_err());
+        assert!(certificate_source_policy_allows(
+            [
+                "urn:autobricks:allowed-source-cidr:192.0.2.0/24",
+                "urn:autobricks:allowed-source-cidr:198.51.100.0/24",
+            ],
+            source,
+        )
+        .is_err());
+        assert!(
+            certificate_source_policy_allows(["urn:autobricks:unknown-policy:value"], source,)
+                .is_err()
+        );
     }
 
     #[test]

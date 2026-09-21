@@ -99,6 +99,8 @@
             <p>서버의 Intermediate CA로 클라이언트 인증서를 발급하고, 바로 사용할 수 있는 단일 client.ini를 다운로드합니다.</p>
             <label><span>클라이언트 이름</span><input name="name" required maxlength="64" pattern="[a-zA-Z0-9][a-zA-Z0-9_.-]*" placeholder="예: macbook" autocomplete="off" /></label>
             <label><span>VPN 주소</span><input name="vpnAddress" required placeholder="예: 10.9.1.4" autocomplete="off" /></label>
+            <label><span>허용 접속 IP 대역 (선택)</span><input name="allowedSourceCidr" placeholder="예: 192.0.2.0/24" autocomplete="off" /></label>
+            <p>입력하면 클라이언트 인증서의 URI SAN에 기록합니다. 단일 공개 IP만 허용하려면 /32를 사용합니다.</p>
             <label><span>로그인 ID (선택)</span><input name="loginId" maxlength="64" autocomplete="off" /></label>
             <label><span>로그인 암호 (선택)</span><input name="password" type="password" maxlength="128" autocomplete="new-password" /></label>
             <p>ID와 암호를 함께 입력하면 클라이언트 실행 시 로그인을 요구합니다. 다운로드하는 INI에는 저장되지 않습니다.</p>

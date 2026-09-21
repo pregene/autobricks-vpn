@@ -35,6 +35,8 @@ VPN_CONFIG=/etc/autobricks-vpn/server.ini npm start
 
 추가 팝업의 로그인 ID와 암호는 선택 사항이며 함께 입력해야 합니다. 둘 다 비워 두면 인증서만 확인합니다. 입력하면 서버 `server.ini`의 해당 `[client]` 항목에 `VPN_IP = 지문 ID 암호` 형식으로 저장되고, VPN 클라이언트가 실행 중 터미널에서 ID와 암호를 입력받습니다. 로그인 전에는 VPN 패킷을 전달하지 않습니다. 다운로드하는 클라이언트 INI에는 ID와 암호가 포함되지 않습니다.
 
+`허용 접속 IP 대역`은 선택 사항입니다. 입력하면 클라이언트 인증서의 URI SAN에 `urn:autobricks:allowed-source-cidr:<IPv4 CIDR>` 형식으로 기록합니다. 단일 공개 IP는 `/32`로 입력하고, 제한하지 않으려면 비워 둡니다. 이 값은 다운로드하는 클라이언트 INI에는 추가하지 않습니다.
+
 발급을 사용하려면 `server.ini`의 `[server]`에 `certificate_file`, `root_ca_file`, `intermediate_ca_file`, `intermediate_ca_key_file`, `public_address`를 설정합니다. `public_address`는 서버 인증서의 IP SAN과 일치해야 합니다. 다운로드한 INI에는 개인키가 포함되므로 배포할 때 파일 권한을 소유자 전용으로 설정하세요 (`chmod 600 client.ini`).
 
 서버 인증서를 한 파일로 관리하려면 `server.ini`에 `[certificate]`(서버 인증서), `[key]`(서버 개인키), `[ca]`(클라이언트 인증서 검증용 CA 체인)를 추가합니다. 발급용 CA도 `[root_ca]`, `[intermediate_ca]`, `[intermediate_key]`에 넣을 수 있습니다. 내장 섹션이 있으면 파일 경로보다 우선합니다. 개인키가 들어 있는 `server.ini`는 `chmod 600`으로 보호하세요.
