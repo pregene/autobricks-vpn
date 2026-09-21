@@ -43,7 +43,7 @@ VPN_CONFIG=/etc/autobricks-vpn/server.ini npm start
 
 Express는 `server.ini`의 `control_socket`에 `WATCH` 구독을 연결하고 Rust VPN 서버가 push하는 세션 변경 이벤트를 브라우저 SSE로 전달합니다. 브라우저와 Express 어느 쪽도 연결 상태 확인을 위한 주기적 polling을 수행하지 않습니다. 클라이언트 삭제는 등록과 활성 세션을 함께 제거합니다. 클라이언트가 별도 종료 메시지 없이 멈춘 경우 서버는 마지막 활동 후 300초에 세션을 제거합니다.
 
-기본 control socket은 `/var/run/autobricks-vpn.sock`이며 VPN 서버가 `0660` 권한으로 생성합니다. `server.ini`에 `control_socket_group = staff`처럼 웹 프로세스가 속한 그룹을 지정한 뒤 VPN 서버를 다시 시작하면 해당 그룹이 소켓에 적용됩니다. macOS에서 일반 사용자로 웹을 실행할 때 사용할 수 있습니다.
+기본 control socket은 `/var/run/autobricks-vpn.sock`이며 VPN 서버가 `0660` 권한으로 생성합니다. Linux는 `autobricks` 계정과 그룹으로 웹 서비스를 실행하고 `control_socket_group = autobricks`를 사용합니다. macOS에서 일반 사용자로 웹을 실행할 때는 `control_socket_group = staff`처럼 웹 프로세스가 속한 그룹을 지정한 뒤 VPN 서버를 다시 시작합니다.
 
 운영 이벤트는 웹 프로세스가 VPN 제어 소켓에서 관찰한 변화를 기록합니다. 최근 100건은 Git에서 제외된 `web/data/activity.json`에 저장되어 웹 재시작 후에도 유지됩니다. 웹이 꺼져 있던 동안의 클라이언트 접속·해지는 소급해서 기록되지 않습니다.
 

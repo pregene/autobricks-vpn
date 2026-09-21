@@ -41,6 +41,7 @@ function shutdown(signal) {
       process.exitCode = 1;
     }
   });
+  server.closeAllConnections?.();
 }
 
 process.on("SIGINT", () => shutdown("SIGINT"));

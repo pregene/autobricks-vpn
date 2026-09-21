@@ -215,6 +215,7 @@ chmod 600 certs/*-key.pem
 | 클라이언트 환경 | 서버 환경 | 검증 항목 | 결과 |
 | --- | --- | --- | --- |
 | Ubuntu 22.04.5 LTS, x86_64, wolfSSL 5.9.1 | Ubuntu 22.04.4 LTS, x86_64 | DTLS 1.3 상호 인증, 인증서 fingerprint/SAN 기반 VPN IP 할당, TUN/MTU 1350, NAT·UDP 포트포워딩 경유 연결, ICMP, TCP/HTTP, VPN DNS, 클라이언트 간 통신 | 성공 |
+| Ubuntu 22.04.5 LTS, x86_64, GitHub Release 0.8.107 | Ubuntu 22.04.4 LTS, x86_64, 0.8.107 | 동봉 wolfSSL 로딩, DTLS 연결, TUN/MTU 1350, ICMP 및 SSH, 웹 실시간 연결 상태 | 성공 (2026-09-22) |
 | macOS 14.6.1, arm64, Rust 1.97.1, wolfSSL 5.9.1 | Ubuntu 22.04.4 LTS, x86_64 | DTLS 1.3 상호 인증, 인증서 fingerprint/SAN 기반 VPN IP 할당, utun/MTU 1350, NAT·UDP 포트포워딩 경유 연결, ICMP, TCP/HTTP, VPN DNS, Linux 클라이언트 접속 | 성공 |
 | Windows | Ubuntu Linux | Wintun 생성, DTLS 연결, 인증서 검증, VPN route 및 실제 터널 통신 | 미검증 (테스트 예정) |
 | Windows x64/MSVC | macOS, 10.10.254.202 | Wintun, DTLS 연결·CA 인증, 10.9.1.3 → 10.9.1.1 ICMP, Ctrl+C 정상 종료와 경로 복구 | 성공: 안정화 후 8/8 응답, 손실 0%. SSH 연결도 사용자 확인([상세](RESULT.md)). SAN 검증·강제 DNS·처리량·재접속은 별도 시험 |

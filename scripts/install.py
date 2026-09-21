@@ -186,7 +186,9 @@ mtu = 1350
 
 def permissions(web_user, web_group, web):
     owner(CONFIG_DIR, "root", web_group)
-    CONFIG_DIR.chmod(0o750)
+    # ServerConfig replaces server.ini atomically, so the dedicated web group
+    # needs directory write permission as well as access to the file itself.
+    CONFIG_DIR.chmod(0o770)
     owner(CONFIG, web_user)
     CERT_DIR.chmod(0o750)
     owner(CERT_DIR, "root", web_group)
@@ -257,6 +259,7 @@ StartLimitBurst=5
 Type=simple
 ExecStart={binary_dir}/vpn-server --config {CONFIG}
 Restart=on-failure
+RestartSec=0
 
 [Install]
 WantedBy=multi-user.target
@@ -277,6 +280,7 @@ Environment=NODE_ENV=production
 Environment=VPN_CONFIG={CONFIG}
 ExecStart={node} {web}/src/server.js
 Restart=on-failure
+RestartSec=0
 
 [Install]
 WantedBy=multi-user.target
@@ -314,7 +318,7 @@ def main():
             raise RuntimeError("macOS에서는 일반 사용자 계정에서 ./install.sh를 실행하세요")
         web_group = "autobricks-vpn"
     else:
-        web_user = web_group = "autobricks-vpn"
+        web_user = web_group = "autobricks"
     existing = CONFIG.exists()
     if existing:
         required = [CERT_DIR / name for name in ("root-ca-cert.pem", "intermediate-ca-cert.pem",

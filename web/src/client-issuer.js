@@ -69,7 +69,8 @@ export class ClientIssuer {
     }
     const sanIp = serverCertificate.subjectAltName?.match(/IP Address:([0-9.]+)/)?.[1];
     const serverAddress = settings.publicAddress || sanIp;
-    if (!serverAddress || !/^(?:\d{1,3}\.){3}\d{1,3}$/.test(serverAddress) || (sanIp && serverAddress !== sanIp)) {
+    if (!serverAddress || !/^(?:\d{1,3}\.){3}\d{1,3}$/.test(serverAddress) ||
+        (settings.issuedClientVerifyServerSanIp && sanIp && serverAddress !== sanIp)) {
       throw bad("서버 공개 주소가 인증서 SAN IP와 일치해야 합니다.", 503, "invalid_server_address");
     }
 
@@ -94,7 +95,11 @@ export class ClientIssuer {
       if (!certificate.checkIssued(issuer) || !certificate.verify(issuer.publicKey)) throw bad("발급된 인증서를 검증할 수 없습니다.", 503, "certificate_issuance_failed");
       const fingerprint = certificate.fingerprint256.replaceAll(":", "").toLowerCase();
       const config = `[client]\nserver_address = ${serverAddress}\nverify_server_san_ip = true\nport = ${settings.port}\nkeepalive_interval = 30\ninput_process_batch = 64\ncertificate_file = embedded\nprivate_key_file = embedded\nca_file = embedded\nocsp_enabled = false\ntun_name = autobricks1\nvpn_address = ${vpnAddress}\nvpn_gateway = ${settings.vpnAddress}\nvpn_network = ${settings.vpnNetwork}\ndns_server = ${settings.vpnAddress}\nforce_dns = false\nmtu = ${settings.mtu}\n\n${pemSection("certificate", certificatePem)}\n${pemSection("key", privateKey)}\n${pemSection("ca", `${intermediatePem.trim()}\n${rootPem.trim()}`)}`;
-      return { vpnAddress, fingerprint, filename: `${name}-client.ini`, content: config };
+      const clientConfig = config.replace(
+        "verify_server_san_ip = true",
+        `verify_server_san_ip = ${settings.issuedClientVerifyServerSanIp}`,
+      );
+      return { vpnAddress, fingerprint, filename: `${name}-client.ini`, content: clientConfig };
     } finally {
       fs.rmSync(temporary, { recursive: true, force: true });
     }

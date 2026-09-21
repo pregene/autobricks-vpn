@@ -25,6 +25,10 @@ export function readServerSettings(configPath) {
   const entries = new Map(parseSection(fs.readFileSync(configPath, "utf8"), "server"));
   const port = Number.parseInt(entries.get("port") ?? "4433", 10);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("server.ini contains an invalid port");
+  const issuedClientVerifyServerSanIp = entries.get("issued_client_verify_server_san_ip") ?? "true";
+  if (!/^(?:true|false)$/i.test(issuedClientVerifyServerSanIp)) {
+    throw new Error("server.ini contains an invalid issued_client_verify_server_san_ip");
+  }
   return {
     listenAddress: entries.get("listen_address") ?? "0.0.0.0",
     port,
@@ -32,6 +36,7 @@ export function readServerSettings(configPath) {
     vpnAddress: entries.get("vpn_address") ?? "10.8.1.1",
     vpnNetwork: entries.get("vpn_network") ?? "10.8.1.0/24",
     mtu: Number.parseInt(entries.get("mtu") ?? "1200", 10),
+    issuedClientVerifyServerSanIp: issuedClientVerifyServerSanIp.toLowerCase() === "true",
     ...(entries.has("certificate_file") && { certificateFile: entries.get("certificate_file") }),
     ...(entries.has("root_ca_file") && { rootCaFile: entries.get("root_ca_file") }),
     ...(entries.has("intermediate_ca_file") && { intermediateCaFile: entries.get("intermediate_ca_file") }),

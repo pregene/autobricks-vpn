@@ -25,7 +25,19 @@ test("reads only the TCP port setting needed by the local web listener", () => {
       vpnAddress: "10.8.1.1",
       vpnNetwork: "10.8.1.0/24",
       mtu: 1200,
+      issuedClientVerifyServerSanIp: true,
     });
+  } finally {
+    fs.rmSync(directory, { recursive: true });
+  }
+});
+
+test("reads the explicit SAN verification policy for issued clients", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "autobricks-web-test-"));
+  const configPath = path.join(directory, "server.ini");
+  fs.writeFileSync(configPath, SAMPLE.replace("port = 4433", "port = 4433\nissued_client_verify_server_san_ip = false"));
+  try {
+    assert.equal(readServerSettings(configPath).issuedClientVerifyServerSanIp, false);
   } finally {
     fs.rmSync(directory, { recursive: true });
   }

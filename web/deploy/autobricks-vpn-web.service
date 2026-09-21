@@ -7,8 +7,8 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-User=autobricks-vpn
-Group=autobricks-vpn
+User=autobricks
+Group=autobricks
 WorkingDirectory=/opt/autobricks-vpn/web
 Environment=NODE_ENV=production
 Environment=VPN_CONFIG=/etc/autobricks-vpn/server.ini
