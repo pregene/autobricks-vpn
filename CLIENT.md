@@ -29,14 +29,14 @@ Linux에서는 `/dev/net/tun` 접근 권한과 `ip` 명령이 필요하다. `for
 
 ## 0.8.107 클라이언트 압축 파일
 
-`client-package/`에 `autobricks-vpn-0.8.107-{macos,linux}-{arm64,x86_64}.tar.gz` 네 파일과 `SHA256SUMS`가 있다. 각 압축 파일에는 `vpn-client`, `libautobricks_vpn` 공유 라이브러리, 해당 아키텍처로 빌드한 wolfSSL 공유 라이브러리가 들어 있다. 세 파일을 같은 디렉터리에 둬야 한다. 발급한 `client.ini`는 별도로 보관하고 `--config`로 지정한다.
+[GitHub Release v0.8.107](https://github.com/pregene/autobricks-vpn/releases/tag/v0.8.107)에 `autobricks-vpn-0.8.107-{macos,linux}-{arm64,x86_64}.tar.gz` 네 파일과 `SHA256SUMS`를 첨부한다. 각 압축 파일에는 `vpn-client`, `libautobricks_vpn` 공유 라이브러리, 해당 아키텍처로 빌드한 wolfSSL 공유 라이브러리가 들어 있다. 세 파일을 같은 디렉터리에 둬야 한다. 발급한 `client.ini`는 별도로 보관하고 `--config`로 지정한다.
 
 ```sh
 tar -xzf autobricks-vpn-0.8.107-linux-x86_64.tar.gz
 sudo ./vpn-client --config /path/to/client.ini
 ```
 
-macOS ARM64·x86_64는 이 Mac에서 `--help` 실행과 VPN 라이브러리의 wolfSSL 로딩을 확인했다. Linux ARM64·x86_64는 Docker 빌드 컨테이너에서 실행과 wolfSSL 링크를 확인했다. 이 네 압축 파일 자체를 이용한 VPN 접속 시험은 아직 하지 않았다. 압축 파일의 체크섬은 `cd client-package && shasum -a 256 -c SHA256SUMS`로 확인한다.
+macOS ARM64·x86_64는 이 Mac에서 `--help` 실행과 VPN 라이브러리의 wolfSSL 로딩을 확인했다. Linux ARM64·x86_64는 Docker 빌드 컨테이너에서 실행과 wolfSSL 링크를 확인했다. 이 네 압축 파일 자체를 이용한 VPN 접속 시험은 아직 하지 않았다. Release에서 받은 압축 파일과 `SHA256SUMS`를 같은 폴더에 놓고 `shasum -a 256 -c SHA256SUMS`로 체크섬을 확인한다.
 
 ## Windows 클라이언트 상태
 
