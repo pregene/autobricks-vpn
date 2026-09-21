@@ -3,7 +3,7 @@
 wolfSSL 기반 DTLS 1.3 VPN transport shared library와 서버/클라이언트 예제입니다.
 
 ```text
-Autobricks VPN 0.8.106
+Autobricks VPN 0.8.107
 Copyright © 2026 Autobricks.co.kr. All rights reserved.
 ```
 
@@ -94,6 +94,8 @@ flowchart LR
 `Queue<T>`는 용량이 찼을 때 가장 오래된 패킷을 제거하고 소비자를 깨웁니다. 종료할 때는 큐를 닫아 대기 중인 작업을 깨웁니다. 서버의 두 공용 큐는 각각 4096패킷, 세션별 송신 큐는 각각 512패킷입니다. 방향별 overflow 수는 클라이언트 연결 또는 서버 종료 시 로그로 출력합니다. TCP 신뢰성과 재전송은 터널 내부 TCP endpoint가 담당하며, DTLS application data 자체는 손실 패킷을 재전송하지 않습니다.
 
 ## 개발환경 구성
+
+운영 서버는 `./build.sh`(또는 `./build.sh --release`)로 `bin/`을 만든 뒤 `./install.sh`로 설치합니다. 인증서 생성과 서비스 등록 절차는 [INSTALL.md](INSTALL.md)를 참고합니다.
 
 ### 공통 요구사항
 

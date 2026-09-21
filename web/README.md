@@ -49,7 +49,7 @@ Express는 `server.ini`의 `control_socket`에 `WATCH` 구독을 연결하고 Ru
 
 ## systemd 재시작 제한
 
-`deploy/autobricks-vpn-web.service`는 프로세스가 오류로 종료되면 3초 후 다시 시작하지만 최대 5회까지만 시작합니다. `StartLimitIntervalSec=infinity`를 사용하므로 시간이 지난다고 실패 횟수가 자동 초기화되지 않습니다. 다섯 번째 실행도 실패하면 systemd가 재시작을 중단하고 unit을 `failed` 상태로 유지합니다. 원인을 수정한 다음 관리자가 명시적으로 다음 명령을 실행해야 다시 시작합니다.
+`deploy/autobricks-vpn-web.service`는 프로세스가 오류로 종료되면 재시작하며, 첫 실행을 포함해 최대 5회까지만 시작합니다. `RestartSec`를 지정하지 않아 systemd의 기본 재시작 지연값을 따릅니다. `StartLimitIntervalSec=infinity`를 사용하므로 시간이 지난다고 시작 횟수가 자동 초기화되지 않습니다. 다섯 번째 실행도 실패하면 systemd가 재시작을 중단하고 unit을 `failed` 상태로 유지합니다. 원인을 수정한 다음 관리자가 명시적으로 다음 명령을 실행해야 다시 시작합니다.
 
 ```sh
 sudo systemctl reset-failed autobricks-vpn-web.service
@@ -70,7 +70,7 @@ sudo install -D -m 0644 \
 
 설치 후에는 `sudo systemctl daemon-reload`가 필요합니다. 서버의 기존 service 사용자, 그룹, 실행 경로를 확인하기 전에는 예제 unit을 그대로 설치하지 않습니다.
 
-VPN 서버도 오류 종료 후 3초 간격으로 재시작하며 최대 5회 실패하면 `failed` 상태로 멈춥니다. 복구할 때는 다음처럼 실패 횟수를 명시적으로 초기화합니다.
+VPN 서버도 오류 종료 후 systemd의 기본 재시작 지연값을 따르며, 첫 실행을 포함해 최대 5회 시작한 뒤 `failed` 상태로 멈춥니다. 복구할 때는 다음처럼 시작 횟수를 명시적으로 초기화합니다.
 
 ```sh
 sudo systemctl reset-failed autobricks-vpn.service
